@@ -1,0 +1,5 @@
+FROM python:3.8-slim
+WORKDIR /app
+RUN pip install websocket-client kafka-python pymongo
+COPY realtime/realtime_producer.py .
+CMD ["python", "-u", "realtime_producer.py"]

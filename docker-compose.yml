@@ -1,0 +1,122 @@
+version: '3'
+
+services:
+  #  เปลี่ยน Kafka เป็นระบบ KRaft (ดูแลตัวเอง) 
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    networks:
+      - stock-network
+
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - stock-network
+
+  # Producer (ตัวดึงข้อมูล) 
+  realtime-producer:
+    build:
+      context: .
+      dockerfile: Dockerfile.producer
+    container_name: realtime_producer
+    restart: always
+    depends_on:
+      - kafka
+    networks:
+      - stock-network
+
+  # Consumer (ตัวรับข้อมูล)
+  realtime-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
+    container_name: realtime_consumer
+    restart: always
+    depends_on:
+      - kafka
+      - mongodb
+    networks:
+      - stock-network
+
+  airflow-db:
+    image: postgres:13
+    container_name: airflow-db
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    networks:
+      - stock-network
+
+  airflow-webserver:
+    image: apache/airflow:2.7.1
+    depends_on:
+      - airflow-db
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./scripts:/opt/airflow/scripts
+      - ./bronze:/opt/airflow/bronze
+      - ./requirements.txt:/opt/airflow/requirements.txt
+      - airflow_logs:/opt/airflow/logs
+    ports:
+      - "8080:8080"
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__WEBSERVER__SECRET_KEY=my_super_secret_key_123
+      - _AIRFLOW_DB_UPGRADE=true
+      - _AIRFLOW_WWW_USER_CREATE=true
+      - _AIRFLOW_WWW_USER_USERNAME=airflow
+      - _AIRFLOW_WWW_USER_PASSWORD=airflow
+      - _PIP_ADDITIONAL_REQUIREMENTS=-r /opt/airflow/requirements.txt
+    command: >
+      bash -c "airflow db init &&
+      airflow users create --username airflow --password airflow --firstname Ake --lastname Thanet --role Admin --email admin@example.com || true &&
+      airflow webserver"
+    networks:
+      - stock-network
+
+  airflow-scheduler:
+    image: apache/airflow:2.7.1
+    depends_on:
+      - airflow-db
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./bronze:/opt/airflow/bronze
+      - ./scripts:/opt/airflow/scripts
+      - ./requirements.txt:/opt/airflow/requirements.txt
+      - airflow_logs:/opt/airflow/logs
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__WEBSERVER__SECRET_KEY=my_super_secret_key_123
+      - _PIP_ADDITIONAL_REQUIREMENTS=-r /opt/airflow/requirements.txt
+    command: airflow scheduler
+    networks:
+      - stock-network
+  
+volumes:
+  mongo_data:
+  airflow_logs:
+
+networks:
+  stock-network:
+    driver: bridge

@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+.env
+
+mongo_data/
+kafka_data/
+
+# ไฟล์ OS
+.DS_Store

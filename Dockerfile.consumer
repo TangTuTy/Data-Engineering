@@ -1,0 +1,5 @@
+FROM python:3.8-slim
+WORKDIR /app
+RUN pip install kafka-python pymongo
+COPY realtime/realtime_consumer.py .
+CMD ["python", "-u", "realtime_consumer.py"]
