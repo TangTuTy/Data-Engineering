@@ -1,3 +1,4 @@
+import os
 import websocket
 import json
 import datetime
@@ -6,20 +7,28 @@ from kafka import KafkaProducer
 from pymongo import MongoClient
 
 # --- CONFIGURATION ---
-FINNHUB_TOKEN = "d7jk169r01qhf13f60agd7jk169r01qhf13f60b0"  # << ใส่ Token
+FINNHUB_TOKEN = os.environ.get("FINNHUB_TOKEN")
+if not FINNHUB_TOKEN:
+    raise RuntimeError(
+        "FINNHUB_TOKEN environment variable is not set. "
+        "กรุณาตั้งค่าใน .env หรือ docker-compose.yml"
+    )
 
-MAX_ROWS_PER_RUN = 5000
-SEND_INTERVAL = 5
-MAX_SYMBOLS = 50  # Finnhub free tier limit
+MAX_ROWS_PER_RUN = int(os.environ.get("MAX_ROWS_PER_RUN", 5000))
+SEND_INTERVAL    = int(os.environ.get("SEND_INTERVAL", 5))
+MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS", 50))  # Finnhub free tier limit
+
+MONGO_URI    = os.environ.get("MONGO_URI", "mongodb://mongodb:27017/")
+KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:29092")
+
 
 # --- ดึง Top 50 หุ้นจาก MongoDB (เลือกจากแต่ละ sector) ---
 def get_top_symbols():
     """เลือก Top symbols จากแต่ละ GICS sector ให้ครบ 50 ตัว"""
     try:
-        client = MongoClient('mongodb://mongodb:27017/', serverSelectionTimeoutMS=5000)
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         db = client['stock_database']
 
-        # ลองอ่านจาก sp500_tickers ก่อน
         tickers = list(db['sp500_tickers'].find({}, {'symbol': 1, 'gics_sector': 1}))
         client.close()
 
@@ -27,14 +36,12 @@ def get_top_symbols():
             print("ไม่มีข้อมูล sp500_tickers ใช้ default symbols")
             return get_default_symbols()
 
-        # จัดกลุ่มตาม sector
         from collections import defaultdict
         sector_symbols = defaultdict(list)
         for t in tickers:
             sector = t.get('gics_sector', 'Unknown')
             sector_symbols[sector].append(t['symbol'])
 
-        # เลือกให้แต่ละ sector ได้สัดส่วนเท่าๆ กัน
         num_sectors = len(sector_symbols)
         per_sector = max(1, MAX_SYMBOLS // num_sectors)
 
@@ -42,7 +49,6 @@ def get_top_symbols():
         for sector, symbols in sorted(sector_symbols.items()):
             selected.extend(symbols[:per_sector])
 
-        # ถ้ายังไม่ครบ 50 เติมจาก sector ที่มีเยอะ
         remaining = MAX_SYMBOLS - len(selected)
         if remaining > 0:
             all_remaining = []
@@ -79,7 +85,6 @@ def get_default_symbols():
 SYMBOLS = get_top_symbols()
 print(f"Tracking {len(SYMBOLS)} symbols: {SYMBOLS[:10]}...")
 
-# ตัวแปรควบคุม
 last_sent_time = {}
 rows_sent = 0
 
@@ -88,7 +93,7 @@ producer = None
 while producer is None:
     try:
         producer = KafkaProducer(
-            bootstrap_servers=['kafka:29092'],
+            bootstrap_servers=[KAFKA_BROKER],
             value_serializer=lambda v: json.dumps(v).encode('utf-8')
         )
         print("Connected to Kafka!")

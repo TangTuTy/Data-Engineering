@@ -1,10 +1,52 @@
-# Python
+# ============ Python ============
 __pycache__/
 *.pyc
-.env
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
 
+# ============ Virtual envs ============
+.venv/
+venv/
+env/
+ENV/
+
+# ============ Secrets / Config ============
+.env
+*.env
+.env.local
+.env.*.local
+!.env.example
+
+# ============ Data / DB volumes ============
 mongo_data/
 kafka_data/
+zookeeper_data/
+zookeeper_log/
+logs/
 
-# ไฟล์ OS
+# ============ Airflow ============
+airflow_logs/
+airflow/logs/
+dags/__pycache__/
+*.db
+airflow.cfg
+webserver_config.py
+
+# ============ IDE ============
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ============ OS ============
 .DS_Store
+Thumbs.db
+
+# ============ Jupyter ============
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ============ Streamlit ============
+.streamlit/secrets.toml
