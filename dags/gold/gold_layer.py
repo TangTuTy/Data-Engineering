@@ -247,10 +247,12 @@ def build_gold_war_daily_timeline():
     db = client[DB_NAME]
 
     try:
+        # FIX: เอา "period": "war" ออก เพื่อให้ดึงทั้งก่อน/หลังสงคราม
+        # และเพิ่ม period ใน projection เพื่อเก็บข้อมูลช่วงลงไปใน gold record
         records = list(
             db[SILVER_HISTORICAL_COLLECTION].find(
-                {"period": "war", "daily_return_pct": {"$ne": None}},
-                {"_id": 0, "date": 1, "sector": 1, "daily_return_pct": 1},
+                {"daily_return_pct": {"$ne": None}},
+                {"_id": 0, "date": 1, "sector": 1, "daily_return_pct": 1, "period": 1},
             )
         )
 
@@ -259,6 +261,8 @@ def build_gold_war_daily_timeline():
             return
 
         daily_sector = defaultdict(lambda: defaultdict(list))
+        daily_period = {}  # เก็บ period ของแต่ละวัน (pre_war / war)
+
         for record in records:
             normalized_date = _to_date(record.get("date"))
             sector = record.get("sector", "Unknown")
@@ -269,6 +273,7 @@ def build_gold_war_daily_timeline():
 
             date_key = normalized_date.strftime("%Y-%m-%d")
             daily_sector[date_key][sector].append(daily_return)
+            daily_period[date_key] = record.get("period", "unknown")
 
         gold_records = []
         for date_key in sorted(daily_sector.keys()):
@@ -287,6 +292,7 @@ def build_gold_war_daily_timeline():
 
             gold_records.append({
                 "date": date_key,
+                "period": daily_period.get(date_key, "unknown"),
                 "market_avg_return": market_avg,
                 "best_sector": best_sector,
                 "best_sector_return": sector_returns.get(best_sector, 0),
@@ -300,6 +306,7 @@ def build_gold_war_daily_timeline():
         if gold_records:
             target_collection.insert_many(gold_records)
             target_collection.create_index("date", unique=True)
+            target_collection.create_index("period")
 
         print(f"Loaded {len(gold_records)} records into {GOLD_WAR_TIMELINE_COLLECTION}.")
 
