@@ -23,7 +23,7 @@ Finnhub WebSocket → Kafka → MongoDB (live_trades) → Alerts & Dashboard
 
 ---
 
-## Setup สำหรับสมาชิกในกลุ่ม
+## Setup 
 
 ### 1. Clone project
 ```bash
@@ -36,7 +36,7 @@ cd data-engineering
 cp .env.example .env
 ```
 
-### 3. (Optional) สมัคร Finnhub API — เฉพาะคนที่จะรัน realtime
+### 3. สมัคร Finnhub API 
 - ไปที่ https://finnhub.io/register
 - สมัครบัญชี (ฟรี)
 - Copy API token จาก Dashboard
@@ -76,33 +76,6 @@ docker-compose up -d
 
 ---
 
-## โครงสร้างไฟล์
-
-```
-data-engineering/
-├── dags/
-│   ├── bronze/
-│   │   ├── reference_data.py       # ดึง S&P 500 จาก Wikipedia
-│   │   ├── backfill_layer.py       # ดึง historical prices
-│   │   ├── bronze_layer.py         # ดึง daily prices
-│   │   └── company_profiles_layer.py
-│   ├── silver/
-│   │   └── silver_layer.py         # transform + war impact analysis
-│   ├── gold/
-│   │   └── gold_layer.py           # aggregate summaries
-│   └── pipelines/                  # DAG definitions
-├── realtime/
-│   ├── realtime_producer.py        # Finnhub → Kafka
-│   └── realtime_consumer.py        # Kafka → MongoDB + alerts
-├── app.py                          # Streamlit dashboard
-├── docker-compose.yml
-├── requirements.txt
-├── .env                            # Secrets (ห้าม commit)
-└── .env.example                    # Template
-```
-
----
-
 ## MongoDB Collections
 
 ### Bronze (raw)
@@ -126,34 +99,4 @@ data-engineering/
 
 ---
 
-## Realtime Alert Types
 
-Consumer ตรวจจับ alert 6 ประเภทและเก็บใน `live_trades.status`:
-
-| Alert | เงื่อนไข |
-|---|---|
-| `alert_extreme_up` | ราคา > +10% vs baseline |
-| `alert_spike` | ราคา > +5% vs baseline |
-| `alert_extreme_down` | ราคา < -10% vs baseline |
-| `alert_crash` | ราคา < -5% vs baseline |
-| `alert_war_sensitive` | หุ้นใน sector negative + ราคาตก |
-| `alert_volume_spike` | volume > 2x baseline |
-
----
-
-## Troubleshooting
-
-**Backfill ช้า**
-Bottleneck อยู่ที่ MongoDB write (CPU ~100%) ไม่ใช่ Yahoo API
-
-**Silver พังเพราะ Date type ไม่ตรง**
-`silver_layer.py` มี `_to_date()` แปลงทั้ง datetime, date, และ string แล้ว
-
-**Realtime ครอบคลุมแค่ ~50 หุ้น**
-Finnhub free tier จำกัด จึงใช้เป็น watchlist ไม่ใช่ทั้ง S&P 500
-
----
-
-## Team
-
-Data Engineering Project — S&P 500 War Impact Analysis
