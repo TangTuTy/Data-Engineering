@@ -1,15 +1,25 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.operators.empty import EmptyOperator
-from datetime import datetime, timedelta
 from pymongo import MongoClient
 from collections import defaultdict
 import logging
 import statistics
+from datetime import datetime, date
 
 MONGO_URI = 'mongodb://mongodb:27017/'
 DB_NAME = 'stock_database'
-WAR_START_DATE = '2026-01-01'
+WAR_START_DATE = datetime.strptime('2026-01-01', '%Y-%m-%d').date()
+
+def _to_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        for fmt in ('%Y-%m-%d', '%Y-%m-%d %H:%M:%S'):
+            try:
+                return datetime.strptime(value, fmt).date()
+            except ValueError:
+                continue
+    return None
 
 
 def get_sp500_symbols():
@@ -37,7 +47,6 @@ def get_sector_map():
                 'sector': doc['gics_sector'],
                 'industry': doc.get('gics_sub_industry', 'Unknown'),
             }
-    # Normalize sector names (yfinance ใช้ชื่อไม่ตรงกันบางตัว)
     SECTOR_NORMALIZE = {
         "Financials": "Financial Services",
     }
@@ -73,10 +82,12 @@ def transform_historical_to_silver():
 
         silver_records = []
         for symbol, rows in grouped.items():
+            rows = sorted(rows, key=lambda x: _to_date(x.get('Date')) or date.min)
             meta = sector_map.get(symbol, {})
             prev_close = None
             for i, row in enumerate(rows):
-                date_str = row.get('Date', '')
+                date_value = row.get('Date')
+                normalized_date = _to_date(date_value)
                 close = row.get('Close')
                 high = row.get('High')
                 low = row.get('Low')
@@ -84,18 +95,18 @@ def transform_historical_to_silver():
                 volume = row.get('Volume')
 
                 daily_return_pct = None
-                if prev_close and prev_close != 0 and close is not None:
+                if prev_close is not None and prev_close != 0 and close is not None:
                     daily_return_pct = round(((close - prev_close) / prev_close) * 100, 4)
 
-                period = "war" if date_str >= WAR_START_DATE else "pre_war"
+                period = "war" if normalized_date and normalized_date >= WAR_START_DATE else "pre_war"
 
                 rec = {
                     "symbol": symbol,
-                    "date": date_str,
-                    "open": round(open_price, 2) if open_price else None,
-                    "high": round(high, 2) if high else None,
-                    "low": round(low, 2) if low else None,
-                    "close": round(close, 2) if close else None,
+                    "date": date_value,
+                    "open": round(open_price, 2) if open_price is not None else None,
+                    "high": round(high, 2) if high is not None else None,
+                    "low": round(low, 2) if low is not None else None,
+                    "close": round(close, 2) if close is not None else None,
                     "volume": volume,
                     "daily_return_pct": daily_return_pct,
                     "sector": meta.get("sector", "Unknown"),
@@ -118,7 +129,6 @@ def transform_historical_to_silver():
                 silver_records.append(rec)
                 prev_close = close
 
-        # Deduplicate: เก็บแถวสุดท้ายของแต่ละ (symbol, date)
         seen = {}
         for r in silver_records:
             key = (r['symbol'], r['date'])
@@ -137,13 +147,6 @@ def transform_historical_to_silver():
 
 
 def classify_war_impact():
-    """
-    Data-driven classification:
-    1. คำนวณ cumulative return pre_war vs war per stock
-    2. คำนวณ performance_shift = war - pre_war
-    3. จัดกลุ่ม sector ตาม median shift
-    4. Classify: strong_positive / moderate_positive / neutral / moderate_negative / strong_negative
-    """
     client = MongoClient(MONGO_URI)
     db = client[DB_NAME]
     silver_daily = db['silver_historical_daily']
@@ -163,21 +166,36 @@ def classify_war_impact():
             war_returns = [r['daily_return_pct'] for r in rows
                           if r.get('period') == 'war' and r.get('daily_return_pct') is not None]
 
-            pre_rows = sorted([r for r in rows if r.get('period') == 'pre_war'], key=lambda x: x['date'])
-            war_rows = sorted([r for r in rows if r.get('period') == 'war'], key=lambda x: x['date'])
+            pre_rows = sorted(
+                [r for r in rows if r.get('period') == 'pre_war'],
+                key=lambda x: _to_date(x.get('date')) or date.min,
+            )
+            war_rows = sorted(
+                [r for r in rows if r.get('period') == 'war'],
+                key=lambda x: _to_date(x.get('date')) or date.min,
+            )
 
             pre_cum = None
-            if pre_rows and pre_rows[0].get('close') and pre_rows[-1].get('close') and pre_rows[0]['close'] != 0:
+            if (
+                pre_rows
+                and pre_rows[0].get('close') is not None
+                and pre_rows[-1].get('close') is not None
+                and pre_rows[0]['close'] != 0
+            ):
                 pre_cum = round(((pre_rows[-1]['close'] - pre_rows[0]['close']) / pre_rows[0]['close']) * 100, 2)
 
             war_cum = None
-            if war_rows and war_rows[0].get('close') and war_rows[-1].get('close') and war_rows[0]['close'] != 0:
+            if (
+                war_rows
+                and war_rows[0].get('close') is not None
+                and war_rows[-1].get('close') is not None
+                and war_rows[0]['close'] != 0
+            ):
                 war_cum = round(((war_rows[-1]['close'] - war_rows[0]['close']) / war_rows[0]['close']) * 100, 2)
 
             sector = rows[0].get('sector', 'Unknown')
             industry = rows[0].get('industry', 'Unknown')
 
-            # Normalized shift: ใช้ avg daily return เทียบกัน (ยุติธรรมเพราะจำนวนวันต่างกัน)
             perf_shift = None
             pre_avg = round(statistics.mean(pre_war_returns), 4) if pre_war_returns else None
             war_avg = round(statistics.mean(war_returns), 4) if war_returns else None
@@ -199,7 +217,6 @@ def classify_war_impact():
                 "war_days": len(war_returns),
             })
 
-        # Sector-level classification
         sector_stocks = defaultdict(list)
         for m in stock_metrics:
             sector_stocks[m['sector']].append(m)
@@ -214,7 +231,6 @@ def classify_war_impact():
             avg_war_cum = round(statistics.mean(war_cums), 2) if war_cums else 0
             avg_war_vol = round(statistics.mean(war_vols), 2) if war_vols else 0
 
-            # Thresholds สำหรับ avg daily return shift (%/day)
             if median_shift >= 0.15:
                 label = "strong_positive"
             elif median_shift >= 0.05:
@@ -235,12 +251,10 @@ def classify_war_impact():
                 "war_impact_label": label,
             })
 
-        # Map impact back to stocks
         sector_impact = {s['sector']: s['war_impact_label'] for s in sector_summary}
         for m in stock_metrics:
             m['war_impact'] = sector_impact.get(m['sector'], 'unknown')
 
-        # Write to MongoDB
         db['silver_stock_war_metrics'].delete_many({})
         if stock_metrics:
             db['silver_stock_war_metrics'].insert_many(stock_metrics)
@@ -262,7 +276,6 @@ def classify_war_impact():
 
 
 def enrich_company_profiles():
-    """เสริม company_profiles ด้วย war_impact จาก data-driven classification"""
     client = MongoClient(MONGO_URI)
     db = client[DB_NAME]
     try:
@@ -276,9 +289,13 @@ def enrich_company_profiles():
 
         profiles = list(db['company_profiles'].find({}, {"_id": 0}))
         silver_profiles = []
+        SECTOR_NORMALIZE = {
+            "Financials": "Financial Services",
+        }
         for p in profiles:
             symbol = p.get('symbol')
-            sector = p.get('sector', 'Unknown')
+            raw_sector = p.get('sector', 'Unknown')
+            sector = SECTOR_NORMALIZE.get(raw_sector, raw_sector)
             metrics = stock_metrics.get(symbol, {})
             silver_profiles.append({
                 "symbol": symbol,
@@ -306,7 +323,6 @@ def enrich_company_profiles():
 
 
 def transform_live_trades_to_silver():
-    """Bronze -> Silver: live_trades -> silver_live_trades"""
     client = MongoClient(MONGO_URI)
     db = client[DB_NAME]
     try:
@@ -352,44 +368,3 @@ def transform_live_trades_to_silver():
         logging.info(f"Silver live trades: {len(silver_records)} (deduped from {len(records)})")
     finally:
         client.close()
-
-
-# === DAG ===
-default_args = {
-    'owner': 'Ake',
-    'start_date': datetime(2026, 4, 1),
-    'retries': 2,
-    'retry_delay': timedelta(minutes=2),
-}
-
-with DAG(
-    dag_id='silver_layer_transform',
-    default_args=default_args,
-    description='Silver Layer: transform + data-driven war impact classification',
-    schedule_interval='30 18 * * 1-5',
-    catchup=False,
-    tags=['silver', 'stock_pipeline', 'sp500', 'us_iran_war'],
-) as dag:
-
-    start = EmptyOperator(task_id='start')
-    end = EmptyOperator(task_id='end')
-
-    task_historical = PythonOperator(
-        task_id='transform_historical_to_silver',
-        python_callable=transform_historical_to_silver,
-    )
-    task_classify = PythonOperator(
-        task_id='classify_war_impact',
-        python_callable=classify_war_impact,
-    )
-    task_company = PythonOperator(
-        task_id='enrich_company_profiles',
-        python_callable=enrich_company_profiles,
-    )
-    task_live = PythonOperator(
-        task_id='transform_live_trades_to_silver',
-        python_callable=transform_live_trades_to_silver,
-    )
-
-    # Historical -> Classify -> (Company + Live)
-    start >> task_historical >> task_classify >> [task_company, task_live] >> end
