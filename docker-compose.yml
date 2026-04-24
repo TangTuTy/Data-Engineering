@@ -44,6 +44,8 @@ services:
       - kafka
     networks:
       - stock-network
+    env_file:
+      - .env
 
   # Consumer (ตัวรับข้อมูล)
   realtime-consumer:
