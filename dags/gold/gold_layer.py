@@ -4,6 +4,8 @@ from datetime import datetime, date
 import logging
 import pandas as pd
 
+from utils.data_quality import DataQualityChecker
+
 
 MONGO_URI = "mongodb://mongodb:27017/"
 DB_NAME = "stock_database"
@@ -89,6 +91,13 @@ def build_gold_sector_summary():
 
         gold_records.sort(key=lambda x: x["median_performance_shift"], reverse=True)
 
+        # ───── Data Quality Gate ─────
+        dq = DataQualityChecker(stage="gold_sector_war_summary")
+        dq.check_completeness(gold_records, ["sector", "war_impact_label"])
+        dq.check_uniqueness(gold_records, ["sector"])
+        dq.check_validity(gold_records, "stock_count", min_value=0)
+        dq.run()
+
         target_collection = db[GOLD_SECTOR_SUMMARY_COLLECTION]
         target_collection.delete_many({})
         if gold_records:
@@ -144,6 +153,14 @@ def build_gold_stock_ranking():
                 "pre_war_volatility": metric.get("pre_war_volatility"),
                 "war_avg_daily_return": metric.get("war_avg_daily_return"),
             })
+
+        # ───── Data Quality Gate ─────
+        dq = DataQualityChecker(stage="gold_stock_ranking")
+        dq.check_completeness(gold_records, ["symbol", "rank", "sector"])
+        dq.check_uniqueness(gold_records, ["symbol"])
+        dq.check_uniqueness(gold_records, ["rank"])
+        dq.check_validity(gold_records, "rank", min_value=1)
+        dq.run()
 
         target_collection = db[GOLD_STOCK_RANKING_COLLECTION]
         target_collection.delete_many({})
@@ -223,6 +240,13 @@ def build_gold_weekly_sector_performance():
 
         gold_records.sort(key=lambda x: (x["sector"], x["week"]))
 
+        # ───── Data Quality Gate ─────
+        dq = DataQualityChecker(stage="gold_weekly_sector_performance")
+        dq.check_completeness(gold_records, ["sector", "week", "period"])
+        dq.check_uniqueness(gold_records, ["sector", "week"])
+        dq.check_validity(gold_records, "data_points", min_value=0)
+        dq.run()
+
         target_collection = db[GOLD_WEEKLY_PERFORMANCE_COLLECTION]
         target_collection.delete_many({})
         if gold_records:
@@ -299,6 +323,12 @@ def build_gold_war_daily_timeline():
                 "worst_sector_return": sector_returns.get(worst_sector, 0),
                 "sector_returns": sector_returns,
             })
+
+        # ───── Data Quality Gate ─────
+        dq = DataQualityChecker(stage="gold_war_daily_timeline")
+        dq.check_completeness(gold_records, ["date", "period"])
+        dq.check_uniqueness(gold_records, ["date"])
+        dq.run()
 
         target_collection = db[GOLD_WAR_TIMELINE_COLLECTION]
         target_collection.delete_many({})
