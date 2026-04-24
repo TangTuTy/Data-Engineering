@@ -22,44 +22,97 @@ MONGO_URI    = os.environ.get("MONGO_URI", "mongodb://mongodb:27017/")
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:29092")
 
 
-# --- ดึง Top 50 หุ้นจาก MongoDB (เลือกจากแต่ละ sector) ---
+# --- ดึง Top 50 หุ้นจาก MongoDB (Smart Selection จาก batch results) ---
 def get_top_symbols():
-    """เลือก Top symbols จากแต่ละ GICS sector ให้ครบ 50 ตัว"""
+    """
+    Smart symbol selection สำหรับ realtime watchlist
+    เลือก 50 หุ้นจากผล batch analysis แบ่งเป็น 3 กลุ่ม:
+
+    1) 30 War-Sensitive: หุ้นที่ |performance_shift| สูงสุด
+       → "หุ้นที่กระทบสงครามจริง" — track impact realtime
+
+    2) 15 Sector Flagships: หุ้นใหญ่จาก war-sensitive sectors
+       → "หุ้น representative ของ sector" — ดู sector trend
+
+    3) 5 Mega-cap Control: AAPL, MSFT, GOOGL, AMZN, BRK-B
+       → "control group" — เทียบกับตลาดโดยรวม
+
+    Fallback: ถ้า batch ยังไม่มี → ใช้ default symbols
+    """
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         db = client['stock_database']
 
-        tickers = list(db['sp500_tickers'].find({}, {'symbol': 1, 'gics_sector': 1}))
+        # ───── 1) War-Sensitive: top 30 by |performance_shift| ─────
+        war_sensitive_symbols = []
+        try:
+            ranking = list(db['gold_stock_ranking'].find(
+                {"performance_shift": {"$ne": None}},
+                {"symbol": 1, "performance_shift": 1, "sector": 1, "_id": 0}
+            ))
+            ranking.sort(key=lambda x: abs(x.get('performance_shift', 0)), reverse=True)
+            war_sensitive_symbols = [r['symbol'] for r in ranking[:30]]
+            print(f"  ✓ War-sensitive (top 30): {war_sensitive_symbols[:5]}...")
+        except Exception as e:
+            print(f"  ⚠️ Could not load gold_stock_ranking: {e}")
+
+        # ───── 2) Sector Flagships: 15 หุ้นใหญ่จาก war-sensitive sectors ─────
+        flagship_symbols = []
+        try:
+            sectors = list(db['gold_sector_war_summary'].find(
+                {"war_impact_label": {"$in": ["positive", "negative", "strong_positive", "strong_negative"]}},
+                {"sector": 1, "_id": 0}
+            ))
+            war_sectors = [s['sector'] for s in sectors]
+
+            for sector in war_sectors[:5]:  # 5 sectors แรก × 3 ตัว = 15
+                top_in_sector = list(db['silver_company_enriched'].find(
+                    {
+                        "sector": sector,
+                        "market_cap": {"$ne": None},
+                        "symbol": {"$nin": war_sensitive_symbols + flagship_symbols},
+                    },
+                    {"symbol": 1, "_id": 0}
+                ).sort("market_cap", -1).limit(3))
+                flagship_symbols.extend([s['symbol'] for s in top_in_sector])
+
+            print(f"  ✓ Sector flagships (15): {flagship_symbols[:5]}...")
+        except Exception as e:
+            print(f"  ⚠️ Could not load flagships: {e}")
+
+        # ───── 3) Mega-cap Control Group ─────
+        control_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "BRK-B"]
+        control_symbols = [s for s in control_symbols
+                          if s not in war_sensitive_symbols + flagship_symbols]
+
         client.close()
 
-        if not tickers:
-            print("ไม่มีข้อมูล sp500_tickers ใช้ default symbols")
-            return get_default_symbols()
+        # ───── รวมทั้งหมด ─────
+        selected = war_sensitive_symbols + flagship_symbols + control_symbols
+        selected = selected[:MAX_SYMBOLS]
 
-        from collections import defaultdict
-        sector_symbols = defaultdict(list)
-        for t in tickers:
-            sector = t.get('gics_sector', 'Unknown')
-            sector_symbols[sector].append(t['symbol'])
+        if len(selected) < MAX_SYMBOLS:
+            print(f"  ⚠️ Got {len(selected)} from batch, padding with defaults...")
+            defaults = get_default_symbols()
+            for sym in defaults:
+                if sym not in selected:
+                    selected.append(sym)
+                if len(selected) >= MAX_SYMBOLS:
+                    break
 
-        num_sectors = len(sector_symbols)
-        per_sector = max(1, MAX_SYMBOLS // num_sectors)
+        if not selected:
+            print("  ⚠️ No batch data available, using all defaults")
+            return get_default_symbols()[:MAX_SYMBOLS]
 
-        selected = []
-        for sector, symbols in sorted(sector_symbols.items()):
-            selected.extend(symbols[:per_sector])
+        print(f"📊 Total selected: {len(selected)} symbols")
+        print(f"   - {len(war_sensitive_symbols[:30])} war-sensitive")
+        print(f"   - {len(flagship_symbols)} sector flagships")
+        print(f"   - {len([s for s in control_symbols if s in selected])} control")
 
-        remaining = MAX_SYMBOLS - len(selected)
-        if remaining > 0:
-            all_remaining = []
-            for sector, symbols in sector_symbols.items():
-                all_remaining.extend(symbols[per_sector:])
-            selected.extend(all_remaining[:remaining])
-
-        return selected[:MAX_SYMBOLS]
+        return selected
 
     except Exception as e:
-        print(f"Error reading MongoDB: {e}")
+        print(f"❌ Error in smart selection: {e}")
         return get_default_symbols()
 
 

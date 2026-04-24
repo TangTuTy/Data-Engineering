@@ -11,6 +11,9 @@ MONGO_URI = 'mongodb://mongodb:27017/'
 DB_NAME = 'stock_database'
 BATCH_SIZE = 20  # profile ต้องทีละตัว แต่จัด batch เพื่อจัดการ retry
 
+# INCREMENTAL: ถ้า profile เก่ากว่า N วัน ค่อยดึงใหม่
+PROFILE_REFRESH_DAYS = 30
+
 
 def get_sp500_symbols():
     client = MongoClient(MONGO_URI)
@@ -22,8 +25,40 @@ def get_sp500_symbols():
     return symbols
 
 
+def _needs_refresh(profile_doc, threshold_days=PROFILE_REFRESH_DAYS):
+    """
+    ตรวจว่า profile นี้ควรดึงใหม่หรือไม่
+    - ไม่มี profile → True
+    - profile เก่ากว่า threshold_days → True
+    - profile sector เป็น null (ดึงไม่ครบครั้งก่อน) → True
+    """
+    if not profile_doc:
+        return True
+
+    if not profile_doc.get('sector'):
+        return True  # ดึงไม่สำเร็จครั้งก่อน — ลองใหม่
+
+    updated_at = profile_doc.get('updated_at')
+    if not updated_at:
+        return True
+
+    try:
+        last = datetime.strptime(updated_at, '%Y-%m-%d %H:%M:%S')
+        age_days = (datetime.now() - last).days
+        return age_days >= threshold_days
+    except (ValueError, TypeError):
+        return True  # parse ไม่ได้ → ดึงใหม่เพื่อความปลอดภัย
+
+
 def fetch_profiles_batch(batch_num):
-    """ดึง company profile จาก yfinance เป็น batch"""
+    """
+    ดึง company profile จาก yfinance เป็น batch
+
+    INCREMENTAL PROCESSING:
+    - ตรวจ updated_at ของแต่ละ profile ก่อนดึง
+    - ดึงเฉพาะที่เก่ากว่า PROFILE_REFRESH_DAYS หรือไม่มี
+    - Idempotent ผ่าน update_one + upsert=True
+    """
     all_symbols = get_sp500_symbols()
 
     start_idx = batch_num * BATCH_SIZE
@@ -34,14 +69,38 @@ def fetch_profiles_batch(batch_num):
         logging.info(f"Batch {batch_num}: ไม่มีหุ้น")
         return
 
-    logging.info(f"Batch {batch_num}: ดึง profile {len(batch_symbols)} ตัว")
-
     client = MongoClient(MONGO_URI)
     db = client[DB_NAME]
     collection = db['company_profiles']
 
     try:
-        for symbol in batch_symbols:
+        # ───── INCREMENTAL: เช็ค profile ที่มีอยู่แล้ว ─────
+        existing_profiles = {
+            doc['symbol']: doc
+            for doc in collection.find(
+                {"symbol": {"$in": batch_symbols}},
+                {"symbol": 1, "sector": 1, "updated_at": 1}
+            )
+        }
+
+        symbols_to_fetch = [
+            s for s in batch_symbols
+            if _needs_refresh(existing_profiles.get(s))
+        ]
+
+        skipped = len(batch_symbols) - len(symbols_to_fetch)
+        logging.info(
+            f"Batch {batch_num}: total {len(batch_symbols)} | "
+            f"📥 to fetch: {len(symbols_to_fetch)} | "
+            f"⏭️  skipped (recent): {skipped}"
+        )
+
+        if not symbols_to_fetch:
+            logging.info(f"✅ Batch {batch_num}: all profiles up-to-date — skip (idempotent)")
+            return
+
+        fetched, errors = 0, 0
+        for symbol in symbols_to_fetch:
             try:
                 time.sleep(2)
 
@@ -58,15 +117,23 @@ def fetch_profiles_batch(batch_num):
                     "updated_at": time.strftime('%Y-%m-%d %H:%M:%S'),
                 }
 
+                # IDEMPOTENT: update_one + upsert
                 collection.update_one(
                     {"symbol": symbol},
                     {"$set": profile},
                     upsert=True
                 )
-                logging.info(f"  {symbol}: OK ({info.get('sector', 'N/A')})")
+                fetched += 1
+                logging.info(f"  ✅ {symbol}: OK ({info.get('sector', 'N/A')})")
 
             except Exception as e:
-                logging.error(f"  {symbol} error: {str(e)}")
+                errors += 1
+                logging.error(f"  ❌ {symbol} error: {str(e)}")
                 continue
+
+        logging.info(
+            f"📊 Batch {batch_num} summary: "
+            f"fetched={fetched}, skipped={skipped}, errors={errors}"
+        )
     finally:
         client.close()
