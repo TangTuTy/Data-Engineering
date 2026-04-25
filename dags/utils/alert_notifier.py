@@ -105,7 +105,10 @@ def send_discord_alert(symbol, alert_type, price, impact_pct, sector=None,
         req = request.Request(
             DISCORD_WEBHOOK_URL,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://github.com, 1.0)"  
+            },
             method="POST",
         )
         with request.urlopen(req, timeout=5) as resp:
@@ -141,7 +144,10 @@ def send_critical_pipeline_alert(message, stage="pipeline"):
 
     try:
         req = request.Request(DISCORD_WEBHOOK_URL, data=data,
-                             headers={"Content-Type": "application/json"}, method="POST")
+                             headers={
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://github.com, 1.0)"  
+            }, method="POST")
         with request.urlopen(req, timeout=5):
             return True
     except Exception as e:
