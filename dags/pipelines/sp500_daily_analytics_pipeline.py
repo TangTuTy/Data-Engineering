@@ -3,7 +3,7 @@ from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 
 from bronze.bronze_layer import load_sp500_daily_to_bronze
-from silver.silver_layer import (
+from silver.silver_layer_dag import (
     transform_historical_to_silver,
     classify_war_impact,
     enrich_company_profiles,

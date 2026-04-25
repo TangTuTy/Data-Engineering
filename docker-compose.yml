@@ -134,6 +134,8 @@ services:
     volumes:
       - ./:/app
       - ./requirements-streamlit.txt:/app/requirements-streamlit.txt
+    environment:
+      - MONGO_HOST=mongodb
     ports:
       - "8501:8501"
     command: >

@@ -152,6 +152,7 @@ def build_gold_stock_ranking():
                 "war_volatility": metric.get("war_volatility"),
                 "pre_war_volatility": metric.get("pre_war_volatility"),
                 "war_avg_daily_return": metric.get("war_avg_daily_return"),
+                "war_latest_close": metric.get("war_latest_close"),
             })
 
         # ───── Data Quality Gate ─────
