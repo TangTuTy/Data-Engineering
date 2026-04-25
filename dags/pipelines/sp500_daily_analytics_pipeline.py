@@ -3,7 +3,7 @@ from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 
 from bronze.bronze_layer import load_sp500_daily_to_bronze
-from silver.silver_layer_dag import (
+from silver.silver_layer import (
     transform_historical_to_silver,
     classify_war_impact,
     enrich_company_profiles,
@@ -14,6 +14,10 @@ from gold.gold_layer import (
     build_gold_stock_ranking,
     build_gold_weekly_sector_performance,
     build_gold_war_daily_timeline,
+    build_dim_date,
+    build_dim_company,
+    build_dim_sector,
+    build_fact_daily_prices,
 )
 from utils.alert_notifier import send_critical_pipeline_alert
 
@@ -104,6 +108,27 @@ with DAG(
         python_callable=build_gold_war_daily_timeline,
     )
 
+    # ───── Star Schema (Fact + Dimension Tables) ─────
+    dim_date_task = PythonOperator(
+        task_id="build_dim_date",
+        python_callable=build_dim_date,
+    )
+
+    dim_company_task = PythonOperator(
+        task_id="build_dim_company",
+        python_callable=build_dim_company,
+    )
+
+    dim_sector_task = PythonOperator(
+        task_id="build_dim_sector",
+        python_callable=build_dim_sector,
+    )
+
+    fact_daily_prices_task = PythonOperator(
+        task_id="build_fact_daily_prices",
+        python_callable=build_fact_daily_prices,
+    )
+
     bronze_task >> silver_transform_task >> silver_classify_task
     silver_classify_task >> [silver_enrich_task, silver_live_task]
 
@@ -111,3 +136,12 @@ with DAG(
     silver_enrich_task >> gold_ranking_task
     [silver_transform_task, silver_enrich_task] >> gold_weekly_task
     silver_transform_task >> gold_timeline_task
+
+    # ───── Star Schema dependencies ─────
+    # Dim tables depend on their sources:
+    silver_transform_task >> dim_date_task            # dim_date ← silver_historical
+    silver_enrich_task    >> dim_company_task          # dim_company ← silver_company_enriched
+    gold_sector_task      >> dim_sector_task           # dim_sector ← gold_sector_war_summary
+
+    # Fact table depends on ALL dimensions (FK lookup)
+    [dim_date_task, dim_company_task, dim_sector_task] >> fact_daily_prices_task

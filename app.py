@@ -698,8 +698,17 @@ with col_live:
     st.markdown("##### ราคาล่าสุด — Finnhub Watchlist")
     watchlist_prices = fetch_latest_per_symbol()
     if watchlist_prices:
+        # state สำหรับ show more/less
+        if "live_show_all" not in st.session_state:
+            st.session_state["live_show_all"] = False
+
+        INITIAL_SHOW = 12
+        total = len(watchlist_prices)
+        show_all = st.session_state["live_show_all"]
+        items_to_show = watchlist_prices if show_all else watchlist_prices[:INITIAL_SHOW]
+
         cards_html = '<div class="ticker-grid">'
-        for t in watchlist_prices:
+        for t in items_to_show:
             sym   = t.get("_id", "-")
             price = t.get("price", 0) or 0
             imp   = t.get("live_war_return_pct") or 0
@@ -714,6 +723,26 @@ with col_live:
             )
         cards_html += '</div>'
         st.markdown(cards_html, unsafe_allow_html=True)
+
+        # ปุ่ม show more / collapse
+        if total > INITIAL_SHOW:
+            st.markdown('<div style="margin-top: 1rem;"></div>', unsafe_allow_html=True)
+            if not show_all:
+                if st.button(
+                    f"⬇️ ดูทั้งหมด ({total} ตัว)",
+                    key="live_show_more",
+                    use_container_width=True,
+                ):
+                    st.session_state["live_show_all"] = True
+                    st.rerun()
+            else:
+                if st.button(
+                    "⬆️ ย่อกลับ",
+                    key="live_show_less",
+                    use_container_width=True,
+                ):
+                    st.session_state["live_show_all"] = False
+                    st.rerun()
     else:
         st.info("ยังไม่มี live trades")
 

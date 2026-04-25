@@ -152,7 +152,6 @@ def build_gold_stock_ranking():
                 "war_volatility": metric.get("war_volatility"),
                 "pre_war_volatility": metric.get("pre_war_volatility"),
                 "war_avg_daily_return": metric.get("war_avg_daily_return"),
-                "war_latest_close": metric.get("war_latest_close"),
             })
 
         # ───── Data Quality Gate ─────
@@ -344,5 +343,295 @@ def build_gold_war_daily_timeline():
         print(f"Error building gold war daily timeline: {e}")
         raise
 
+    finally:
+        client.close()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# STAR SCHEMA — Fact + Dimension Tables (Kimball pattern)
+# ════════════════════════════════════════════════════════════════════════════
+# โครงสร้าง:
+#   fact_daily_prices  ← granular event data (1 row / symbol / date)
+#       FK: date_sk, company_sk, sector_sk
+#   dim_date           ← วันที่ + period attributes
+#   dim_company        ← ข้อมูลบริษัท
+#   dim_sector         ← sector + war_impact attributes
+# ════════════════════════════════════════════════════════════════════════════
+
+DIM_DATE_COLLECTION       = "dim_date"
+DIM_COMPANY_COLLECTION    = "dim_company"
+DIM_SECTOR_COLLECTION     = "dim_sector"
+FACT_DAILY_PRICES_COLLECTION = "fact_daily_prices"
+
+
+def build_dim_date():
+    """
+    Build dim_date — มิติของวันที่
+    Surrogate Key: date_sk (YYYYMMDD format)
+    Attributes: date, year, month, quarter, day_of_week, period (pre_war/war)
+    """
+    client = MongoClient(MONGO_URI)
+    db = client[DB_NAME]
+    silver_daily = db[SILVER_HISTORICAL_COLLECTION]
+    target = db[DIM_DATE_COLLECTION]
+
+    try:
+        # ดึง unique dates จาก fact source (silver_historical_daily)
+        unique_dates = silver_daily.distinct("date")
+        if not unique_dates:
+            print("No dates in silver_historical_daily")
+            return
+
+        WAR_START = datetime.strptime('2026-01-01', '%Y-%m-%d').date()
+        DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                     "Friday", "Saturday", "Sunday"]
+
+        # ───── Parse + Dedup ─────
+        # Mongo distinct() อาจคืน date ในหลาย format (string + datetime)
+        # → parse เป็น date object แล้ว dedup ก่อน build records
+        parsed_dates = set()
+        for d_raw in unique_dates:
+            if isinstance(d_raw, datetime):
+                parsed_dates.add(d_raw.date())
+            elif isinstance(d_raw, date):
+                parsed_dates.add(d_raw)
+            elif isinstance(d_raw, str):
+                try:
+                    parsed_dates.add(datetime.strptime(d_raw[:10], '%Y-%m-%d').date())
+                except ValueError:
+                    continue
+
+        records = []
+        for d in sorted(parsed_dates):
+            # surrogate key = YYYYMMDD (integer)
+            date_sk = int(d.strftime("%Y%m%d"))
+            quarter = (d.month - 1) // 3 + 1
+            period  = "war" if d >= WAR_START else "pre_war"
+
+            records.append({
+                "date_sk": date_sk,
+                "date": d.isoformat(),
+                "year": d.year,
+                "month": d.month,
+                "quarter": quarter,
+                "day_of_week": DAY_NAMES[d.weekday()],
+                "is_weekend": d.weekday() >= 5,
+                "period": period,
+            })
+
+        # ───── DQ Gate ─────
+        dq = DataQualityChecker(stage="dim_date")
+        dq.check_completeness(records, ["date_sk", "date", "year", "period"])
+        dq.check_uniqueness(records, ["date_sk"])
+        dq.check_validity(records, "year", min_value=2020, max_value=2030)
+        dq.run()
+
+        target.delete_many({})
+        if records:
+            target.insert_many(records)
+            target.create_index("date_sk", unique=True)
+            target.create_index("date", unique=True)
+            target.create_index("period")
+
+        print(f"Loaded {len(records)} records into {DIM_DATE_COLLECTION}")
+    finally:
+        client.close()
+
+
+def build_dim_company():
+    """
+    Build dim_company — มิติของบริษัท
+    Surrogate Key: company_sk (สร้างจาก hash ของ symbol)
+    Source: silver_company_enriched
+    """
+    client = MongoClient(MONGO_URI)
+    db = client[DB_NAME]
+    source = db[SILVER_COMPANY_ENRICHED_COLLECTION]
+    target = db[DIM_COMPANY_COLLECTION]
+
+    try:
+        profiles = list(source.find({}, {"_id": 0}))
+        if not profiles:
+            print("No data in silver_company_enriched")
+            return
+
+        # surrogate key = sequential ID (1-based, sorted by symbol สำหรับ stability)
+        records = []
+        for idx, p in enumerate(sorted(profiles, key=lambda x: x.get("symbol", "")), start=1):
+            records.append({
+                "company_sk": idx,
+                "symbol": p.get("symbol"),
+                "full_name": p.get("full_name"),
+                "sector": p.get("sector", "Unknown"),
+                "industry": p.get("industry", "Unknown"),
+                "market_cap": p.get("market_cap"),
+                "war_impact": p.get("war_impact", "unknown"),
+            })
+
+        # ───── DQ Gate ─────
+        dq = DataQualityChecker(stage="dim_company")
+        dq.check_completeness(records, ["company_sk", "symbol", "sector"])
+        dq.check_uniqueness(records, ["company_sk"])
+        dq.check_uniqueness(records, ["symbol"])
+        dq.run()
+
+        target.delete_many({})
+        if records:
+            target.insert_many(records)
+            target.create_index("company_sk", unique=True)
+            target.create_index("symbol", unique=True)
+            target.create_index("sector")
+
+        print(f"Loaded {len(records)} records into {DIM_COMPANY_COLLECTION}")
+    finally:
+        client.close()
+
+
+def build_dim_sector():
+    """
+    Build dim_sector — มิติของ sector
+    Surrogate Key: sector_sk (sequential ID)
+    Source: gold_sector_war_summary
+    """
+    client = MongoClient(MONGO_URI)
+    db = client[DB_NAME]
+    source = db[GOLD_SECTOR_SUMMARY_COLLECTION]
+    target = db[DIM_SECTOR_COLLECTION]
+
+    try:
+        sectors = list(source.find({}, {"_id": 0}))
+        if not sectors:
+            print("No data in gold_sector_war_summary")
+            return
+
+        records = []
+        for idx, s in enumerate(sorted(sectors, key=lambda x: x.get("sector", "")), start=1):
+            records.append({
+                "sector_sk": idx,
+                "sector": s.get("sector"),
+                "war_impact_label": s.get("war_impact_label", "neutral"),
+                "stock_count": s.get("stock_count", 0),
+                "median_performance_shift": s.get("median_performance_shift", 0),
+                "avg_war_volatility": s.get("avg_war_volatility", 0),
+            })
+
+        # ───── DQ Gate ─────
+        dq = DataQualityChecker(stage="dim_sector")
+        dq.check_completeness(records, ["sector_sk", "sector", "war_impact_label"])
+        dq.check_uniqueness(records, ["sector_sk"])
+        dq.check_uniqueness(records, ["sector"])
+        dq.run()
+
+        target.delete_many({})
+        if records:
+            target.insert_many(records)
+            target.create_index("sector_sk", unique=True)
+            target.create_index("sector", unique=True)
+
+        print(f"Loaded {len(records)} records into {DIM_SECTOR_COLLECTION}")
+    finally:
+        client.close()
+
+
+def build_fact_daily_prices():
+    """
+    Build fact_daily_prices — fact table หลัก
+    Grain: 1 row ต่อ (symbol, date)
+    Foreign Keys: date_sk, company_sk, sector_sk
+    Measures: open, high, low, close, volume, daily_return_pct, moving_avg_*
+
+    Source: silver_historical_daily + dim tables (สำหรับ FK lookup)
+    """
+    client = MongoClient(MONGO_URI)
+    db = client[DB_NAME]
+    silver_daily = db[SILVER_HISTORICAL_COLLECTION]
+    target = db[FACT_DAILY_PRICES_COLLECTION]
+
+    try:
+        # ───── โหลด FK lookup tables ─────
+        company_lookup = {}  # symbol -> company_sk
+        for doc in db[DIM_COMPANY_COLLECTION].find({}, {"_id": 0, "symbol": 1, "company_sk": 1}):
+            company_lookup[doc["symbol"]] = doc["company_sk"]
+
+        sector_lookup = {}  # sector -> sector_sk
+        for doc in db[DIM_SECTOR_COLLECTION].find({}, {"_id": 0, "sector": 1, "sector_sk": 1}):
+            sector_lookup[doc["sector"]] = doc["sector_sk"]
+
+        if not company_lookup or not sector_lookup:
+            print("⚠️  Dimension tables empty — run dim builds first")
+            return
+
+        # ───── Build fact records ─────
+        WAR_START = datetime.strptime('2026-01-01', '%Y-%m-%d').date()
+        records_dict = {}  # ใช้ dict เพื่อ dedup โดย (date_sk, company_sk)
+        skipped = 0
+
+        for r in silver_daily.find({}, {"_id": 0}):
+            symbol = r.get("symbol")
+            sector = r.get("sector", "Unknown")
+            d_raw  = r.get("date")
+
+            # Parse date for date_sk
+            if isinstance(d_raw, datetime):
+                d = d_raw.date()
+            elif isinstance(d_raw, date):
+                d = d_raw
+            elif isinstance(d_raw, str):
+                try:
+                    d = datetime.strptime(d_raw[:10], '%Y-%m-%d').date()
+                except ValueError:
+                    skipped += 1
+                    continue
+            else:
+                skipped += 1
+                continue
+
+            # FK lookup
+            company_sk = company_lookup.get(symbol)
+            sector_sk  = sector_lookup.get(sector)
+
+            if company_sk is None or sector_sk is None:
+                skipped += 1
+                continue
+
+            date_sk = int(d.strftime("%Y%m%d"))
+            key = (date_sk, company_sk)  # composite PK
+
+            # ถ้าซ้ำ → ใช้ตัวล่าสุด (overwrite)
+            records_dict[key] = {
+                "date_sk":    date_sk,                     # FK -> dim_date
+                "company_sk": company_sk,                  # FK -> dim_company
+                "sector_sk":  sector_sk,                   # FK -> dim_sector
+                # Measures (numeric facts)
+                "open":               r.get("open"),
+                "high":               r.get("high"),
+                "low":                r.get("low"),
+                "close":               r.get("close"),
+                "volume":             r.get("volume"),
+                "daily_return_pct":   r.get("daily_return_pct"),
+                "moving_avg_7d":      r.get("moving_avg_7d"),
+                "moving_avg_30d":     r.get("moving_avg_30d"),
+            }
+
+        records = list(records_dict.values())
+
+        # ───── DQ Gate ─────
+        dq = DataQualityChecker(stage="fact_daily_prices")
+        dq.check_completeness(records, ["date_sk", "company_sk", "sector_sk", "close"])
+        dq.check_uniqueness(records, ["date_sk", "company_sk"])  # composite key
+        dq.check_validity(records, "close", min_value=0)
+        dq.check_validity(records, "volume", min_value=0)
+        dq.run()
+
+        target.delete_many({})
+        if records:
+            target.insert_many(records)
+            target.create_index([("date_sk", 1), ("company_sk", 1)], unique=True)
+            target.create_index("date_sk")
+            target.create_index("company_sk")
+            target.create_index("sector_sk")
+
+        print(f"Loaded {len(records)} records into {FACT_DAILY_PRICES_COLLECTION} "
+              f"(skipped {skipped} due to missing FK)")
     finally:
         client.close()
