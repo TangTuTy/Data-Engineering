@@ -6,7 +6,7 @@ from kafka import KafkaProducer
 from pymongo import MongoClient
 
 # --- CONFIGURATION ---
-FINNHUB_TOKEN = "d7jk169r01qhf13f60agd7jk169r01qhf13f60b0"  # << ใส่ Token
+FINNHUB_TOKEN = "d7hsj7pr01qu8vfmg860d7hsj7pr01qu8vfmg86g"  # << ใส่ Token
 
 MAX_ROWS_PER_RUN = 5000
 SEND_INTERVAL = 5

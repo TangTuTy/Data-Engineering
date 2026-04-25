@@ -1,25 +1,32 @@
 import streamlit as st
 import pandas as pd
+import time
 from pymongo import MongoClient
 
 st.set_page_config(page_title="S&P 500 — US-Iran War Impact Dashboard", layout="wide")
 
 IMPACT_COLORS = {
+    "strong_positive": "#16a34a",
     "positive": "#22c55e",
     "neutral": "#fbbf24",
     "negative": "#ef4444",
+    "strong_negative": "#b91c1c",
 }
 
 IMPACT_EMOJI = {
-    "positive": "🟢",
+    "strong_positive": "🟢",
+    "positive": "🟩",
     "neutral": "🟡",
-    "negative": "🔴",
+    "negative": "🟥",
+    "strong_negative": "🔴",
 }
 
 
 @st.cache_resource
 def get_db():
-    client = MongoClient("mongodb://mongodb:27017/")
+    import os
+    mongo_host = os.environ.get("MONGO_HOST", "localhost")
+    client = MongoClient(f"mongodb://{mongo_host}:27017/")
     return client["stock_database"]
 
 
@@ -49,14 +56,130 @@ def fetch_realtime_prices(symbols_list):
     return realtime_data
 
 
+@st.cache_data(ttl=3600)
+def fetch_previous_closes(symbols_tuple):
+    """ดึง previous close (ราคาปิดเมื่อวาน) จาก yfinance — cache 1 ชม. เพราะค่าไม่เปลี่ยนระหว่างวัน"""
+    symbols = list(symbols_tuple)
+    if not symbols:
+        return {}
+    try:
+        import yfinance as yf
+        df = yf.download(symbols if len(symbols) > 1 else symbols[0],
+                         period="5d", interval="1d", progress=False, auto_adjust=True)
+        if df.empty:
+            return {}
+        prev_closes = {}
+        if len(symbols) == 1:
+            closes = df["Close"].dropna()
+            if len(closes) >= 2:
+                prev_closes[symbols[0]] = float(closes.iloc[-2])
+        else:
+            for sym in symbols:
+                try:
+                    closes = df[sym]["Close"].dropna() if sym in df.columns.get_level_values(0) else pd.Series()
+                    if len(closes) >= 2:
+                        prev_closes[sym] = float(closes.iloc[-2])
+                except Exception:
+                    pass
+        return prev_closes
+    except Exception:
+        return {}
+
+
 @st.cache_data(ttl=30)
-def fetch_recent_live_trades(limit=8):
-    return list(
-        db["live_trades"]
-        .find({}, {"_id": 0, "symbol": 1, "price": 1, "volume": 1, "timestamp": 1})
-        .sort("timestamp", -1)
-        .limit(limit)
-    )
+def fetch_intraday_movers():
+    """ดึง latest price ของทุก symbol ใน live_trades แล้วคำนวณ Intraday % เทียบ previous close จริง"""
+    pipeline = [
+        {"$sort": {"timestamp": -1}},
+        {"$group": {
+            "_id": "$symbol",
+            "live_price": {"$first": "$price"},
+            "volume": {"$first": "$volume"},
+            "timestamp": {"$first": "$timestamp"},
+        }},
+        {"$project": {"_id": 0, "symbol": "$_id", "live_price": 1, "volume": 1, "timestamp": 1}},
+    ]
+    live_data = {d["symbol"]: d for d in db["live_trades"].aggregate(pipeline)}
+    if not live_data:
+        return [], []
+
+    symbols = list(live_data.keys())
+    # ดึง previous close จาก yfinance (ราคาปิดเมื่อวานจริงๆ)
+    prev_closes = fetch_previous_closes(tuple(sorted(symbols)))
+
+    # fallback: ถ้า yfinance ไม่ได้ ใช้ war_latest_close จาก MongoDB
+    if not prev_closes:
+        prev_closes = {
+            d["symbol"]: d.get("war_latest_close")
+            for d in db["gold_stock_ranking"].find(
+                {"symbol": {"$in": symbols}},
+                {"symbol": 1, "war_latest_close": 1, "_id": 0}
+            )
+            if d.get("war_latest_close")
+        }
+
+    rows = []
+    for sym, d in live_data.items():
+        try:
+            live_price = float(d["live_price"])
+            base = prev_closes.get(sym)
+            if live_price and base and float(base) != 0 and not pd.isna(live_price):
+                intraday_pct = round((live_price - float(base)) / float(base) * 100, 2)
+                rows.append({
+                    "symbol": sym,
+                    "Live Price": f"${live_price:.2f}",
+                    "Intraday %": intraday_pct,
+                    "Volume": int(d["volume"]) if d.get("volume") else 0,
+                    "Updated": d.get("timestamp"),
+                })
+        except Exception:
+            continue
+
+    rows.sort(key=lambda x: x["Intraday %"], reverse=True)
+    gainers = rows[:5]
+    losers = sorted(rows, key=lambda x: x["Intraday %"])[:5]
+
+    for r in gainers + losers:
+        r["_intraday_num"] = r["Intraday %"]
+        r["Intraday %"] = f"{r['Intraday %']:+.2f}%"
+        r["Volume"] = f"{r['Volume']:,}"
+
+    return gainers, losers
+
+
+@st.cache_data(ttl=60)
+def fetch_yfinance_fallback(symbols_tuple):
+    """ดึงราคาล่าสุดจาก yfinance สำหรับ symbols ที่ไม่มีใน live_trades (cache 60s)"""
+    symbols = list(symbols_tuple)
+    if not symbols:
+        return {}
+    try:
+        import yfinance as yf
+        if len(symbols) == 1:
+            df = yf.download(symbols[0], period="1d", interval="1m", progress=False, auto_adjust=True)
+            if not df.empty and "Close" in df.columns:
+                last = df["Close"].dropna()
+                if not last.empty:
+                    return {symbols[0]: float(last.iloc[-1])}
+            return {}
+        else:
+            df = yf.download(
+                symbols, period="1d", interval="1m",
+                progress=False, auto_adjust=True, group_by="ticker",
+            )
+            prices = {}
+            if df.empty:
+                return {}
+            for sym in symbols:
+                try:
+                    last = df[sym]["Close"].dropna()
+                    if not last.empty:
+                        prices[sym] = float(last.iloc[-1])
+                except Exception:
+                    pass
+            return prices
+    except Exception:
+        return {}
 
 
 
@@ -114,6 +237,17 @@ else:
 st.title("📊 S&P 500 — US-Iran War Impact Dashboard")
 st.caption("Medallion Architecture: Bronze → Silver → Gold | Source: yfinance + MongoDB + Airflow")
 
+# Auto-refresh control
+_r_col, _t_col = st.columns([1, 5])
+with _r_col:
+    auto_refresh = st.toggle("🔄 Auto-refresh", value=True)
+with _t_col:
+    if auto_refresh:
+        refresh_interval = st.select_slider(
+            "Interval (seconds)", options=[15, 30, 60, 120], value=30, label_visibility="collapsed"
+        )
+        st.caption(f"Refreshing every {refresh_interval}s")
+
 total_stocks = len(df_stocks) if not df_stocks.empty else 0
 positive_sectors = len(df_sectors[df_sectors["war_impact_label"] == "positive"]) if not df_sectors.empty else 0
 negative_sectors = len(df_sectors[df_sectors["war_impact_label"] == "negative"]) if not df_sectors.empty else 0
@@ -128,16 +262,39 @@ if best_sector_row is not None and worst_sector_row is not None:
 
 st.markdown("---")
 
-st.markdown("### 🔴 Live Trade Monitor")
-live_trades = fetch_recent_live_trades()
-if live_trades:
-    live_df = pd.DataFrame(live_trades)
-    if not live_df.empty:
-        if "timestamp" in live_df.columns:
-            live_df["timestamp"] = pd.to_datetime(live_df["timestamp"], errors="coerce")
-        st.dataframe(live_df, use_container_width=True, hide_index=True)
+def style_intraday_df(df):
+    """ใส่สีเขียว/แดงให้คอลัมน์ Intraday % ตามค่า numeric ใน _intraday_num"""
+    def color_row(row):
+        val = row.get("_intraday_num", 0)
+        color = "color: #22c55e" if val >= 0 else "color: #ef4444"
+        return [color if col == "Intraday %" else "" for col in row.index]
+    display_cols = ["symbol", "Live Price", "Intraday %", "Volume"]
+    styled = df.style.apply(color_row, axis=1)
+    return styled, display_cols
+
+
+st.markdown("### 🔴 Live Trade Monitor — Intraday Biggest Movers")
+gainers, losers = fetch_intraday_movers()
+if gainers or losers:
+    col_g, col_l = st.columns(2)
+    with col_g:
+        st.markdown("**🔺 Top 5 Gainers**")
+        if gainers:
+            gdf = pd.DataFrame(gainers)
+            styled_g, cols = style_intraday_df(gdf)
+            st.dataframe(styled_g, column_order=cols, use_container_width=True, hide_index=True)
+        else:
+            st.info("ยังไม่มีข้อมูล")
+    with col_l:
+        st.markdown("**🔻 Top 5 Losers**")
+        if losers:
+            ldf = pd.DataFrame(losers)
+            styled_l, cols = style_intraday_df(ldf)
+            st.dataframe(styled_l, column_order=cols, use_container_width=True, hide_index=True)
+        else:
+            st.info("ยังไม่มีข้อมูล")
 else:
-    st.info("ยังไม่มีข้อมูล live trades")
+    st.info("ยังไม่มีข้อมูล live trades — ตรวจสอบว่า realtime_producer กำลังรันอยู่")
 
 st.markdown("---")
 
@@ -228,14 +385,108 @@ with tab2:
 
         st.markdown("---")
         col_a, col_b = st.columns(2)
+
+        top_positive = filtered.sort_values("performance_shift", ascending=False).head(20)
+        top_negative = filtered.sort_values("performance_shift", ascending=True).head(20)
+
+        # ดึง live price เฉพาะ 40 ตัวนี้เท่านั้น
+        top40_symbols = list(set(top_positive["symbol"].tolist() + top_negative["symbol"].tolist()))
+        rt_top40 = fetch_realtime_prices(top40_symbols)
+
+        # symbols ที่ไม่มีใน live_trades → fallback ดึงจาก yfinance
+        missing = [s for s in top40_symbols if s not in rt_top40 or rt_top40[s].get("price") is None]
+        yf_prices = fetch_yfinance_fallback(tuple(sorted(missing))) if missing else {}
+
+        # รวมทั้งสอง source (live_trades ก่อน, yfinance fallback ถ้าไม่มี)
+        merged_prices = {}
+        for sym in top40_symbols:
+            rt = rt_top40.get(sym, {})
+            live_val = rt.get("price") if rt else None
+            try:
+                if live_val is not None and not pd.isna(float(live_val)) and float(live_val) != 0:
+                    merged_prices[sym] = float(live_val)
+                elif sym in yf_prices:
+                    merged_prices[sym] = yf_prices[sym]
+            except Exception:
+                if sym in yf_prices:
+                    merged_prices[sym] = yf_prices[sym]
+
+        def enrich_with_live(df):
+            df = df.copy()
+
+            def get_live_price(symbol):
+                val = merged_prices.get(symbol)
+                if val is None:
+                    return None
+                try:
+                    f = float(val)
+                    return f if f != 0 and not pd.isna(f) else None
+                except Exception:
+                    return None
+
+            df["_live_price"] = df["symbol"].apply(get_live_price)
+            df["_intraday_num"] = df.apply(
+                lambda row: round(
+                    (row["_live_price"] - row["war_latest_close"]) / row["war_latest_close"] * 100, 2
+                )
+                if (
+                    row["_live_price"] is not None
+                    and row.get("war_latest_close") is not None
+                    and not pd.isna(row.get("war_latest_close", float("nan")))
+                    and row["war_latest_close"] != 0
+                )
+                else None,
+                axis=1,
+            )
+            df["Intraday %"] = df["_intraday_num"].apply(
+                lambda x: f"{x:+.2f}%" if x is not None else "-"
+            )
+            df["Live Price"] = df["_live_price"].apply(
+                lambda x: f"${x:.2f}" if x is not None else "-"
+            )
+            df = df.drop(columns=["_live_price"])
+            return df
+
+        top_positive = enrich_with_live(top_positive)
+        top_negative = enrich_with_live(top_negative)
+
+        top_cols = [
+            "rank", "symbol", "full_name", "sector",
+            "Live Price", "Intraday %",
+            "war_cumulative_return_pct", "performance_shift", "war_impact",
+        ]
+
+        def style_top20(df, show_cols):
+            rename_map = {
+                "war_cumulative_return_pct": "War Cum Return %",
+                "performance_shift": "Shift %/day",
+                "war_impact": "Impact",
+            }
+            display = df[[c for c in show_cols if c in df.columns]].rename(columns=rename_map)
+            def color_intraday(row):
+                styles = ["" for _ in row.index]
+                if "Intraday %" in row.index:
+                    idx = list(row.index).index("Intraday %")
+                    num_col = "_intraday_num"
+                    # ใช้ค่า string เพื่อตรวจ
+                    val_str = row["Intraday %"]
+                    if isinstance(val_str, str) and val_str not in ("-", ""):
+                        try:
+                            val = float(val_str.replace("%", "").replace("+", ""))
+                            styles[idx] = "color: #22c55e" if val >= 0 else "color: #ef4444"
+                        except Exception:
+                            pass
+                return styles
+            return display.style.apply(color_intraday, axis=1)
+
         with col_a:
             st.subheader("🚀 Top 20 Positive")
-            top_positive = filtered.sort_values("performance_shift", ascending=False).head(20)
-            st.dataframe(top_positive[[col for col in available_cols if col in top_positive.columns]], use_container_width=True, hide_index=True)
+            show = [c for c in top_cols if c in top_positive.columns]
+            st.dataframe(style_top20(top_positive, show), use_container_width=True, hide_index=True)
         with col_b:
             st.subheader("📉 Top 20 Negative")
-            top_negative = filtered.sort_values("performance_shift", ascending=True).head(20)
-            st.dataframe(top_negative[[col for col in available_cols if col in top_negative.columns]], use_container_width=True, hide_index=True)
+            show = [c for c in top_cols if c in top_negative.columns]
+            st.dataframe(style_top20(top_negative, show), use_container_width=True, hide_index=True)
     else:
         st.info("ไม่มีข้อมูล stock ranking")
 
@@ -331,3 +582,8 @@ with tab5:
 
 st.markdown("---")
 st.caption(f"S&P 500: {total_stocks} stocks | {len(df_sectors)} sectors | Gold Layer powered by Apache Airflow + MongoDB")
+
+# Auto-refresh: rerun หน้าตาม interval ที่เลือก
+if auto_refresh:
+    time.sleep(refresh_interval)
+    st.rerun()
