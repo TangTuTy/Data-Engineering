@@ -25,17 +25,22 @@ KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:29092")
 # --- ดึง Top 50 หุ้นจาก MongoDB (Smart Selection จาก batch results) ---
 def get_top_symbols():
     """
-    Smart symbol selection สำหรับ realtime watchlist
-    เลือก 50 หุ้นจากผล batch analysis แบ่งเป็น 3 กลุ่ม:
+    Symbol selection สำหรับ realtime watchlist — 50 slots แบ่งตาม use case:
 
-    1) 30 War-Sensitive: หุ้นที่ |performance_shift| สูงสุด
-       → "หุ้นที่กระทบสงครามจริง" — track impact realtime
+    1) 15 Top Winners: performance_shift บวกสูงสุด
+       → ตรงกับ Dashboard Winners panel
 
-    2) 15 Sector Flagships: หุ้นใหญ่จาก war-sensitive sectors
-       → "หุ้น representative ของ sector" — ดู sector trend
+    2) 15 Top Losers: performance_shift ลบสูงสุด (ลบมากสุด)
+       → ตรงกับ Dashboard Losers panel
 
-    3) 5 Mega-cap Control: AAPL, MSFT, GOOGL, AMZN, BRK-B
-       → "control group" — เทียบกับตลาดโดยรวม
+    3) 10 Sector Flagships: market_cap สูงสุดต่อ sector (war-sensitive sectors)
+       → ดู sector trend + alert ระดับ sector
+
+    4) 5 Mega-cap Control: AAPL, MSFT, GOOGL, AMZN, BRK-B
+       → baseline เทียบกับตลาดโดยรวม
+
+    5) 5 High Volatility: หุ้น war-sensitive ที่ไม่อยู่กลุ่มข้างต้น
+       → เพิ่ม coverage สำหรับ price alert
 
     Fallback: ถ้า batch ยังไม่มี → ใช้ default symbols
     """
@@ -43,20 +48,23 @@ def get_top_symbols():
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         db = client['stock_database']
 
-        # ───── 1) War-Sensitive: top 30 by |performance_shift| ─────
-        war_sensitive_symbols = []
-        try:
-            ranking = list(db['gold_stock_ranking'].find(
-                {"performance_shift": {"$ne": None}},
-                {"symbol": 1, "performance_shift": 1, "sector": 1, "_id": 0}
-            ))
-            ranking.sort(key=lambda x: abs(x.get('performance_shift', 0)), reverse=True)
-            war_sensitive_symbols = [r['symbol'] for r in ranking[:30]]
-            print(f"  ✓ War-sensitive (top 30): {war_sensitive_symbols[:5]}...")
-        except Exception as e:
-            print(f"  ⚠️ Could not load gold_stock_ranking: {e}")
+        ranking = list(db['gold_stock_ranking'].find(
+            {"performance_shift": {"$ne": None}},
+            {"symbol": 1, "performance_shift": 1, "sector": 1, "_id": 0}
+        ))
+        ranking.sort(key=lambda x: x.get('performance_shift', 0), reverse=True)
 
-        # ───── 2) Sector Flagships: 15 หุ้นใหญ่จาก war-sensitive sectors ─────
+        # ───── 1) Top 15 Winners (performance_shift บวกสูงสุด) ─────
+        winner_symbols = [r['symbol'] for r in ranking if r.get('performance_shift', 0) > 0][:15]
+        print(f"  ✓ Top Winners (15): {winner_symbols[:5]}...")
+
+        # ───── 2) Top 15 Losers (performance_shift ลบมากสุด) ─────
+        loser_symbols = [r['symbol'] for r in reversed(ranking) if r.get('performance_shift', 0) < 0][:15]
+        print(f"  ✓ Top Losers (15): {loser_symbols[:5]}...")
+
+        used = set(winner_symbols + loser_symbols)
+
+        # ───── 3) Sector Flagships: market_cap สูงสุดต่อ sector (10 ตัว) ─────
         flagship_symbols = []
         try:
             sectors = list(db['gold_sector_war_summary'].find(
@@ -64,32 +72,39 @@ def get_top_symbols():
                 {"sector": 1, "_id": 0}
             ))
             war_sectors = [s['sector'] for s in sectors]
-
-            for sector in war_sectors[:5]:  # 5 sectors แรก × 3 ตัว = 15
-                top_in_sector = list(db['silver_company_enriched'].find(
-                    {
-                        "sector": sector,
-                        "market_cap": {"$ne": None},
-                        "symbol": {"$nin": war_sensitive_symbols + flagship_symbols},
-                    },
+            seen_sectors = set()
+            for sector in war_sectors:
+                if len(flagship_symbols) >= 10:
+                    break
+                if sector in seen_sectors:
+                    continue
+                seen_sectors.add(sector)
+                top = list(db['silver_company_enriched'].find(
+                    {"sector": sector, "market_cap": {"$ne": None}, "symbol": {"$nin": list(used)}},
                     {"symbol": 1, "_id": 0}
-                ).sort("market_cap", -1).limit(3))
-                flagship_symbols.extend([s['symbol'] for s in top_in_sector])
-
-            print(f"  ✓ Sector flagships (15): {flagship_symbols[:5]}...")
+                ).sort("market_cap", -1).limit(1))
+                if top:
+                    flagship_symbols.append(top[0]['symbol'])
+                    used.add(top[0]['symbol'])
+            print(f"  ✓ Sector flagships (10): {flagship_symbols}...")
         except Exception as e:
             print(f"  ⚠️ Could not load flagships: {e}")
 
-        # ───── 3) Mega-cap Control Group ─────
-        control_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "BRK-B"]
-        control_symbols = [s for s in control_symbols
-                          if s not in war_sensitive_symbols + flagship_symbols]
+        # ───── 4) Mega-cap Control (5 ตัว) ─────
+        control_symbols = [s for s in ["AAPL", "MSFT", "GOOGL", "AMZN", "BRK-B"] if s not in used]
+
+        # ───── 5) High Volatility buffer — เติมให้ครบ 50 ─────
+        volatile_symbols = []
+        remaining = MAX_SYMBOLS - len(winner_symbols) - len(loser_symbols) - len(flagship_symbols) - len(control_symbols)
+        if remaining > 0:
+            extra = [r['symbol'] for r in ranking if r['symbol'] not in used][:remaining]
+            volatile_symbols = extra
+            print(f"  ✓ High volatility buffer ({len(volatile_symbols)}): {volatile_symbols[:5]}...")
 
         client.close()
 
-        # ───── รวมทั้งหมด ─────
-        selected = war_sensitive_symbols + flagship_symbols + control_symbols
-        selected = selected[:MAX_SYMBOLS]
+        selected = winner_symbols + loser_symbols + flagship_symbols + control_symbols + volatile_symbols
+        selected = list(dict.fromkeys(selected))[:MAX_SYMBOLS]  # dedup + cap
 
         if len(selected) < MAX_SYMBOLS:
             print(f"  ⚠️ Got {len(selected)} from batch, padding with defaults...")
@@ -105,9 +120,8 @@ def get_top_symbols():
             return get_default_symbols()[:MAX_SYMBOLS]
 
         print(f"📊 Total selected: {len(selected)} symbols")
-        print(f"   - {len(war_sensitive_symbols[:30])} war-sensitive")
-        print(f"   - {len(flagship_symbols)} sector flagships")
-        print(f"   - {len([s for s in control_symbols if s in selected])} control")
+        print(f"   - {len(winner_symbols)} winners | {len(loser_symbols)} losers")
+        print(f"   - {len(flagship_symbols)} sector flagships | {len(control_symbols)} control | {len(volatile_symbols)} volatile")
 
         return selected
 
