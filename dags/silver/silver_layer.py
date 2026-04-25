@@ -390,6 +390,10 @@ def enrich_company_profiles():
         for doc in db['silver_stock_war_metrics'].find({}, {"_id": 0}):
             stock_metrics[doc['symbol']] = doc
 
+        # ใช้ sector_map ที่ merge จาก company_profiles + sp500_tickers (มี fallback อยู่แล้ว)
+        # แทนการอ่าน sector จาก company_profiles ตรงๆ ซึ่งอาจเป็น null ถ้า yfinance ดึงไม่ครบ
+        sector_map = get_sector_map()
+
         profiles = list(db['company_profiles'].find({}, {"_id": 0}))
         silver_profiles = []
         SECTOR_NORMALIZE = {
@@ -397,14 +401,21 @@ def enrich_company_profiles():
         }
         for p in profiles:
             symbol = p.get('symbol')
-            raw_sector = p.get('sector', 'Unknown')
+
+            # ลำดับการหา sector: sector_map (มี fallback) > company_profiles > "Unknown"
+            meta = sector_map.get(symbol, {})
+            raw_sector = meta.get('sector') or p.get('sector') or 'Unknown'
             sector = SECTOR_NORMALIZE.get(raw_sector, raw_sector)
+
+            # industry ก็ fallback เช่นเดียวกัน
+            raw_industry = meta.get('industry') or p.get('industry') or 'Unknown'
+
             metrics = stock_metrics.get(symbol, {})
             silver_profiles.append({
                 "symbol": symbol,
                 "full_name": p.get("full_name"),
                 "sector": sector,
-                "industry": p.get("industry"),
+                "industry": raw_industry,
                 "market_cap": p.get("market_cap"),
                 "business_summary": p.get("business_summary"),
                 "war_impact": impact_map.get(sector, "unknown"),
