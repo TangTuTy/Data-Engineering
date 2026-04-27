@@ -232,9 +232,16 @@ def transform_historical_to_silver():
             logging.info(f"✅ Bulk upsert: {total_upserted} new + {total_modified} updated")
 
         # ───── อัปเดต watermark ─────
-        latest_date = max(_to_date(r['date']) for r in silver_records if _to_date(r.get('date')))
+        # ใช้ max(watermark เดิม, max_date ของ batch) เพื่อป้องกัน watermark ถอยหลัง
+        # กรณี yfinance ดึงข้อมูลได้ไม่ถึงวันปัจจุบัน watermark จะไม่ถูก reset ลง
+        latest_date_in_batch = max(_to_date(r['date']) for r in silver_records if _to_date(r.get('date')))
+        old_watermark = _get_watermark(db, PIPELINE)
+        if old_watermark:
+            latest_date = max(old_watermark, latest_date_in_batch)
+        else:
+            latest_date = latest_date_in_batch
         _set_watermark(db, PIPELINE, latest_date, len(silver_records))
-        logging.info(f"💾 Watermark updated to {latest_date}")
+        logging.info(f"💾 Watermark updated to {latest_date} (batch max={latest_date_in_batch}, prev={old_watermark})")
 
         logging.info(f"Silver historical: {len(silver_records)} records processed")
     finally:
