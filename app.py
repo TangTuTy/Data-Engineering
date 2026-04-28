@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from pymongo import MongoClient
 import yfinance as yf
+import altair as alt
 
 st.set_page_config(
     page_title="S&P 500 — War Impact Dashboard",
@@ -152,6 +153,51 @@ def get_db():
 @st.cache_data(ttl=60)
 def load_col(name):
     return list(db[name].find({}, {"_id": 0}))
+
+@st.cache_data(ttl=60)
+def load_weekly_from_fact():
+    """Aggregate weekly sector performance จาก fact_war_analytics"""
+    pipeline = [
+        {"$match": {"daily_return_pct": {"$ne": None}}},
+        {"$group": {
+            "_id": {"sector": "$sector", "week": "$week_key"},
+            "avg_daily_return_pct": {"$avg": "$daily_return_pct"},
+            "avg_close": {"$avg": "$close"},
+            "data_points": {"$sum": 1},
+            "first_period": {"$first": "$period"},
+        }},
+        {"$project": {
+            "_id": 0,
+            "sector": "$_id.sector",
+            "week": "$_id.week",
+            "avg_daily_return_pct": {"$round": ["$avg_daily_return_pct", 4]},
+            "avg_close": {"$round": ["$avg_close", 2]},
+            "data_points": 1,
+            "period": "$first_period",
+        }},
+        {"$sort": {"sector": 1, "week": 1}},
+    ]
+    return list(db["fact_war_analytics"].aggregate(pipeline))
+
+@st.cache_data(ttl=60)
+def load_timeline_from_fact():
+    """Aggregate daily market timeline จาก fact_war_analytics"""
+    pipeline = [
+        {"$match": {"daily_return_pct": {"$ne": None}}},
+        {"$group": {
+            "_id": "$date",
+            "market_avg_return": {"$avg": "$daily_return_pct"},
+            "period": {"$first": "$period"},
+        }},
+        {"$project": {
+            "_id": 0,
+            "date": "$_id",
+            "market_avg_return": {"$round": ["$market_avg_return", 4]},
+            "period": 1,
+        }},
+        {"$sort": {"date": 1}},
+    ]
+    return list(db["fact_war_analytics"].aggregate(pipeline))
 
 @st.cache_data(ttl=30)
 def fetch_live_prices(symbols):
@@ -314,13 +360,13 @@ def build_insight(df_sec, df_stk):
 # ── Load data ────────────────────────────────────────────────────────────────
 db = get_db()
 
-raw_sectors  = load_col("gold_sector_war_summary")
-raw_stocks   = load_col("gold_stock_ranking")
-raw_weekly   = load_col("gold_weekly_sector_performance")
-raw_timeline = load_col("gold_war_daily_timeline")
+raw_sectors  = load_col("dim_sector")          # ← replaces gold_sector_war_summary
+raw_stocks   = load_col("dim_company")         # ← replaces gold_stock_ranking
+raw_weekly   = load_weekly_from_fact()          # ← aggregation from fact_war_analytics
+raw_timeline = load_timeline_from_fact()        # ← aggregation from fact_war_analytics
 
 if not raw_sectors:
-    st.warning("⏳ Gold Layer ยังไม่มีข้อมูล — กรุณา trigger pipeline ก่อน")
+    st.warning("⏳ Dimension tables ยังไม่มีข้อมูล — กรุณา trigger pipeline ก่อน")
     st.stop()
 
 df_sec = pd.DataFrame(raw_sectors).sort_values("median_performance_shift", ascending=False)
@@ -328,16 +374,7 @@ df_stk = pd.DataFrame(raw_stocks)   if raw_stocks   else pd.DataFrame()
 df_wk  = pd.DataFrame(raw_weekly)   if raw_weekly   else pd.DataFrame()
 df_tl  = pd.DataFrame(raw_timeline) if raw_timeline else pd.DataFrame()
 
-# Merge pre_war_days จาก silver เข้ามา (gold_stock_ranking ไม่ได้เก็บไว้)
-if not df_stk.empty:
-    silver_metrics = list(
-        db["silver_stock_war_metrics"].find(
-            {}, {"_id": 0, "symbol": 1, "pre_war_days": 1, "war_days": 1}
-        )
-    )
-    if silver_metrics:
-        df_sm = pd.DataFrame(silver_metrics)
-        df_stk = df_stk.merge(df_sm, on="symbol", how="left")
+# dim_company มี pre_war_days อยู่แล้ว (ไม่ต้อง merge จาก silver แยกอีกต่อไป)
 
 # live price overlay
 live_syms = df_stk["symbol"].tolist() if not df_stk.empty else []
@@ -391,7 +428,7 @@ if active_alerts:
 # HEADER
 # ════════════════════════════════════════════════════════════════════════════
 st.markdown("## 📊 S&P 500 — War Impact Dashboard")
-st.caption("Batch: S&P 500 ทั้งหมด (yfinance + Airflow)  ·  Realtime: watchlist ~50 หุ้น (Finnhub)  ·  Medallion Architecture")
+st.caption("Batch: S&P 500 ทั้งหมด (yfinance + Airflow)  ·  Realtime: Finnhub WebSocket  ·  Star Schema Architecture")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -436,11 +473,25 @@ if not df_tl.empty:
         bridge_row = pre_df.iloc[[-1]].copy()  # จุดสุดท้ายของ pre_war
         war_df = pd.concat([bridge_row, war_df], ignore_index=True)
 
-    pre_tl = pre_df[["date", "market_avg_return"]].rename(columns={"market_avg_return": "ก่อนสงคราม"})
-    war_tl = war_df[["date", "market_avg_return"]].rename(columns={"market_avg_return": "ช่วงสงคราม"})
+    pre_tl = pre_df[["date", "market_avg_return"]].copy()
+    pre_tl["ช่วงเวลา"] = "ก่อนสงคราม"
+    war_tl = war_df[["date", "market_avg_return"]].copy()
+    war_tl["ช่วงเวลา"] = "ช่วงสงคราม"
+    melted_tl = pd.concat([pre_tl, war_tl], ignore_index=True).dropna(subset=["market_avg_return"])
 
-    chart_tl = pd.merge(pre_tl, war_tl, on="date", how="outer").set_index("date").sort_index()
-    st.line_chart(chart_tl, color=["#63c41a", "#e24b4b"], height=280)
+    tl_chart = (
+        alt.Chart(melted_tl)
+        .mark_line(strokeWidth=2, interpolate="monotone")
+        .encode(
+            x=alt.X("date:T", axis=alt.Axis(format="%b %Y", labelAngle=-45, title=None, tickCount="month")),
+            y=alt.Y("market_avg_return:Q", title="Avg Daily Return (%)"),
+            color=alt.Color("ช่วงเวลา:N", scale=alt.Scale(
+                domain=["ก่อนสงคราม", "ช่วงสงคราม"], range=["#63c41a", "#e24b4b"]
+            ), legend=alt.Legend(orient="top", title=None)),
+        )
+        .properties(height=280)
+    )
+    st.altair_chart(tl_chart, use_container_width=True)
     st.markdown(
         '<p class="war-note">🟢 ก่อนสงคราม &nbsp;·&nbsp; 🔴 ช่วงสงคราม (เริ่ม 1 ม.ค. 2026)</p>',
         unsafe_allow_html=True,
@@ -608,11 +659,41 @@ if not df_wk.empty:
         )
         def _fmt_week(w):
             try:
-                return pd.to_datetime(f"{w}-1", format="%Y-W%W-%w").strftime("%-d %b '%y")
+                return pd.to_datetime(f"{w}-1", format="%Y-W%W-%w").strftime("%-d %b %Y")
             except Exception:
                 return str(w)
-        pivot.index = [_fmt_week(w) for w in pivot.index]
-        st.line_chart(pivot, height=320)
+        # แปลง week key → datetime จริง เพื่อให้ Streamlit เรียง x-axis ตามเวลา
+        sorted_weeks = sorted(pivot.index.tolist())
+        pivot = pivot.loc[sorted_weeks]
+        date_index = []
+        valid_rows = []
+        for i, w in enumerate(sorted_weeks):
+            try:
+                date_index.append(pd.to_datetime(f"{w}-1", format="%Y-W%W-%w"))
+                valid_rows.append(i)
+            except Exception:
+                continue
+        pivot = pivot.iloc[valid_rows]
+        pivot.index = date_index
+        pivot = pivot.apply(pd.to_numeric, errors="coerce")
+        pivot = pivot.dropna(how="all")
+        if not pivot.empty:
+            wk_melted = pivot.reset_index().rename(columns={pivot.index.name or "index": "date"})
+            wk_melted = wk_melted.melt(id_vars="date", var_name="Sector", value_name="avg_return")
+            wk_melted = wk_melted.dropna(subset=["avg_return"])
+            wk_chart = (
+                alt.Chart(wk_melted)
+                .mark_line(strokeWidth=2, interpolate="monotone")
+                .encode(
+                    x=alt.X("date:T", axis=alt.Axis(format="%b %Y", labelAngle=-45, title=None, tickCount="month")),
+                    y=alt.Y("avg_return:Q", title="Avg Daily Return (%)"),
+                    color=alt.Color("Sector:N"),
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(wk_chart, use_container_width=True)
+        else:
+            st.info("ไม่มีข้อมูล weekly performance")
     else:
         st.info("เลือก sector อย่างน้อย 1 กลุ่ม")
 else:
@@ -657,18 +738,51 @@ if search and not df_stk.empty:
         c7.metric("Industry",          s.get("industry", "-"))
 
         hist = list(
-            db["silver_historical_daily"]
+            db["fact_war_analytics"]
             .find({"symbol": search}, {"_id": 0, "date": 1, "close": 1, "period": 1})
             .sort("date", 1)
         )
         if hist:
             hdf = pd.DataFrame(hist)
             hdf["date"] = pd.to_datetime(hdf["date"], errors="coerce")
-            pre_h = hdf[hdf["period"] == "pre_war"][["date", "close"]].rename(columns={"close": "ก่อนสงคราม"})
-            war_h = hdf[hdf["period"] == "war"][["date", "close"]].rename(columns={"close": "ช่วงสงคราม"})
-            chart_h = pd.merge(pre_h, war_h, on="date", how="outer").set_index("date").sort_index()
-            st.markdown("**Price History**")
-            st.line_chart(chart_h, color=["#63c41a", "#e24b4b"], height=280)
+            hdf = hdf.dropna(subset=["date"]).sort_values("date")
+            hdf["close"] = pd.to_numeric(hdf["close"], errors="coerce")
+            hdf = hdf.dropna(subset=["close"])
+
+            if not hdf.empty:
+                pre_h = hdf[hdf["period"] == "pre_war"].copy()
+                war_h = hdf[hdf["period"] == "war"].copy()
+
+                # ── bridge row: เชื่อมจุดสุดท้ายของ pre_war กับเส้น war ──
+                if not pre_h.empty and not war_h.empty:
+                    bridge = pre_h.iloc[[-1]].copy()
+                    war_h = pd.concat([bridge, war_h], ignore_index=True)
+
+                pre_line = pre_h[["date", "close"]].rename(columns={"close": "ก่อนสงคราม"})
+                war_line = war_h[["date", "close"]].rename(columns={"close": "ช่วงสงคราม"})
+                chart_h = pd.merge(pre_line, war_line, on="date", how="outer").set_index("date").sort_index()
+                chart_h = chart_h.apply(pd.to_numeric, errors="coerce")
+
+                st.markdown("**Price History**")
+                if not chart_h.dropna(how="all").empty:
+                    hist_melted = chart_h.reset_index().rename(columns={"index": "date"}) if chart_h.index.name is None else chart_h.reset_index()
+                    hist_melted = hist_melted.melt(id_vars="date", var_name="ช่วงเวลา", value_name="close")
+                    hist_melted = hist_melted.dropna(subset=["close"])
+                    hist_chart = (
+                        alt.Chart(hist_melted)
+                        .mark_line(strokeWidth=2, interpolate="monotone")
+                        .encode(
+                            x=alt.X("date:T", axis=alt.Axis(format="%b %Y", labelAngle=-45, title=None, tickCount="month")),
+                            y=alt.Y("close:Q", title="Price ($)"),
+                            color=alt.Color("ช่วงเวลา:N", scale=alt.Scale(
+                                domain=["ก่อนสงคราม", "ช่วงสงคราม"], range=["#63c41a", "#e24b4b"]
+                            ), legend=alt.Legend(orient="top", title=None)),
+                        )
+                        .properties(height=280)
+                    )
+                    st.altair_chart(hist_chart, use_container_width=True)
+                else:
+                    st.info("ไม่มีข้อมูลราคาย้อนหลัง")
     elif search:
         st.warning(f"ไม่พบ symbol: {search}")
 
@@ -679,7 +793,7 @@ if search and not df_stk.empty:
 st.markdown('<p class="section-head">⚡ live watchlist & alerts</p>', unsafe_allow_html=True)
 st.markdown(
     '<span class="live-dot"></span><strong style="color:#e24b4b;">LIVE</strong> '
-    '<span style="color:#8a8f99; font-size:0.82rem;">— watchlist ~50 หุ้นจาก Finnhub (ไม่ใช่ทั้ง S&amp;P 500)</span>',
+    '<span style="color:#8a8f99; font-size:0.82rem;">— Finnhub WebSocket Realtime</span>',
     unsafe_allow_html=True,
 )
 
@@ -695,17 +809,18 @@ ALERT_ICON = {
 }
 
 with col_live:
-    st.markdown("##### ราคาล่าสุด — Finnhub Watchlist")
+    st.markdown("##### ราคาล่าสุด — Live")
     watchlist_prices = fetch_latest_per_symbol()
     if watchlist_prices:
-        # state สำหรับ show more/less
+        MAX_LIVE = 50  # FIFO: แสดงแค่ 50 ตัวล่าสุด
+        capped = watchlist_prices[:MAX_LIVE]
+
         if "live_show_all" not in st.session_state:
             st.session_state["live_show_all"] = False
 
-        INITIAL_SHOW = 12
-        total = len(watchlist_prices)
+        INITIAL_SHOW = 8  # 2 rows × 4 cols = 8 cards — เท่ากับ alerts ฝั่งขวา
         show_all = st.session_state["live_show_all"]
-        items_to_show = watchlist_prices if show_all else watchlist_prices[:INITIAL_SHOW]
+        items_to_show = capped if show_all else capped[:INITIAL_SHOW]
 
         cards_html = '<div class="ticker-grid">'
         for t in items_to_show:
@@ -724,23 +839,13 @@ with col_live:
         cards_html += '</div>'
         st.markdown(cards_html, unsafe_allow_html=True)
 
-        # ปุ่ม show more / collapse
-        if total > INITIAL_SHOW:
-            st.markdown('<div style="margin-top: 1rem;"></div>', unsafe_allow_html=True)
+        if len(capped) > INITIAL_SHOW:
             if not show_all:
-                if st.button(
-                    f"⬇️ ดูทั้งหมด ({total} ตัว)",
-                    key="live_show_more",
-                    use_container_width=True,
-                ):
+                if st.button(f"⬇️ ดูทั้งหมด ({len(capped)} ตัว)", key="live_show_more", use_container_width=True):
                     st.session_state["live_show_all"] = True
                     st.rerun()
             else:
-                if st.button(
-                    "⬆️ ย่อกลับ",
-                    key="live_show_less",
-                    use_container_width=True,
-                ):
+                if st.button("⬆️ ย่อกลับ", key="live_show_less", use_container_width=True):
                     st.session_state["live_show_all"] = False
                     st.rerun()
     else:
@@ -772,6 +877,6 @@ with col_alert:
 st.markdown("---")
 st.caption(
     f"S&P 500 · {total_stocks:,} stocks · {n_sectors} sectors · "
-    "Gold layer: Apache Airflow + MongoDB · "
-    "Realtime watchlist: Finnhub ~50 symbols via Kafka"
+    "Star Schema: fact_war_analytics + dim tables · Apache Airflow + MongoDB · "
+    "Realtime: Finnhub WebSocket via Kafka"
 )

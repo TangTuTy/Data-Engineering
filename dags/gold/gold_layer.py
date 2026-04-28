@@ -361,7 +361,7 @@ def build_gold_war_daily_timeline():
 DIM_DATE_COLLECTION       = "dim_date"
 DIM_COMPANY_COLLECTION    = "dim_company"
 DIM_SECTOR_COLLECTION     = "dim_sector"
-FACT_DAILY_PRICES_COLLECTION = "fact_daily_prices"
+FACT_WAR_ANALYTICS_COLLECTION = "fact_war_analytics"
 
 
 def build_dim_date():
@@ -408,6 +408,8 @@ def build_dim_date():
             quarter = (d.month - 1) // 3 + 1
             period  = "war" if d >= WAR_START else "pre_war"
 
+            week_key = d.strftime("%Y-W%W")
+
             records.append({
                 "date_sk": date_sk,
                 "date": d.isoformat(),
@@ -417,11 +419,12 @@ def build_dim_date():
                 "day_of_week": DAY_NAMES[d.weekday()],
                 "is_weekend": d.weekday() >= 5,
                 "period": period,
+                "week_key": week_key,
             })
 
         # ───── DQ Gate ─────
         dq = DataQualityChecker(stage="dim_date")
-        dq.check_completeness(records, ["date_sk", "date", "year", "period"])
+        dq.check_completeness(records, ["date_sk", "date", "year", "period", "week_key"])
         dq.check_uniqueness(records, ["date_sk"])
         dq.check_validity(records, "year", min_value=2020, max_value=2030)
         dq.run()
@@ -432,6 +435,7 @@ def build_dim_date():
             target.create_index("date_sk", unique=True)
             target.create_index("date", unique=True)
             target.create_index("period")
+            target.create_index("week_key")
 
         print(f"Loaded {len(records)} records into {DIM_DATE_COLLECTION}")
     finally:
@@ -440,9 +444,9 @@ def build_dim_date():
 
 def build_dim_company():
     """
-    Build dim_company — มิติของบริษัท
-    Surrogate Key: company_sk (สร้างจาก hash ของ symbol)
-    Source: silver_company_enriched
+    Build dim_company — มิติของบริษัท (enriched)
+    Surrogate Key: company_sk (sequential, sorted by symbol)
+    Source: silver_company_enriched + gold_stock_ranking
     """
     client = MongoClient(MONGO_URI)
     db = client[DB_NAME]
@@ -455,17 +459,60 @@ def build_dim_company():
             print("No data in silver_company_enriched")
             return
 
+        # ───── Lookup: gold_stock_ranking (rank, metrics) ─────
+        ranking_lookup = {}
+        for doc in db[GOLD_STOCK_RANKING_COLLECTION].find({}, {"_id": 0}):
+            ranking_lookup[doc.get("symbol")] = doc
+
+        # ───── Lookup: silver_stock_war_metrics (pre_war_days, war_days) ─────
+        war_metrics_lookup = {}
+        for doc in db[SILVER_STOCK_METRICS_COLLECTION].find({}, {"_id": 0}):
+            war_metrics_lookup[doc.get("symbol")] = doc
+
+        # ───── Lookup: war_latest_close จาก silver_historical_daily ─────
+        war_latest_close_lookup = {}
+        try:
+            pipeline = [
+                {"$match": {"period": "war", "close": {"$ne": None}}},
+                {"$sort": {"date": -1}},
+                {"$group": {
+                    "_id": "$symbol",
+                    "latest_close": {"$first": "$close"},
+                }},
+            ]
+            for doc in db[SILVER_HISTORICAL_COLLECTION].aggregate(pipeline):
+                war_latest_close_lookup[doc["_id"]] = doc["latest_close"]
+        except Exception as e:
+            print(f"Warning: could not load war_latest_close: {e}")
+
         # surrogate key = sequential ID (1-based, sorted by symbol สำหรับ stability)
         records = []
         for idx, p in enumerate(sorted(profiles, key=lambda x: x.get("symbol", "")), start=1):
+            symbol = p.get("symbol")
+            rank_data = ranking_lookup.get(symbol, {})
+            metrics_data = war_metrics_lookup.get(symbol, {})
+
             records.append({
                 "company_sk": idx,
-                "symbol": p.get("symbol"),
+                "symbol": symbol,
                 "full_name": p.get("full_name"),
                 "sector": p.get("sector", "Unknown"),
                 "industry": p.get("industry", "Unknown"),
                 "market_cap": p.get("market_cap"),
                 "war_impact": p.get("war_impact", "unknown"),
+                # ── Enriched from gold_stock_ranking ──
+                "rank": rank_data.get("rank"),
+                "performance_shift": rank_data.get("performance_shift"),
+                "war_cumulative_return_pct": rank_data.get("war_cumulative_return_pct"),
+                "pre_war_cumulative_return_pct": rank_data.get("pre_war_cumulative_return_pct"),
+                "war_volatility": rank_data.get("war_volatility"),
+                "pre_war_volatility": rank_data.get("pre_war_volatility"),
+                "war_avg_daily_return": rank_data.get("war_avg_daily_return"),
+                # ── Enriched from silver_stock_war_metrics ──
+                "pre_war_days": metrics_data.get("pre_war_days"),
+                "war_days": metrics_data.get("war_days"),
+                # ── Enriched from silver_historical_daily ──
+                "war_latest_close": war_latest_close_lookup.get(symbol),
             })
 
         # ───── DQ Gate ─────
@@ -481,6 +528,8 @@ def build_dim_company():
             target.create_index("company_sk", unique=True)
             target.create_index("symbol", unique=True)
             target.create_index("sector")
+            target.create_index("rank")
+            target.create_index("war_impact")
 
         print(f"Loaded {len(records)} records into {DIM_COMPANY_COLLECTION}")
     finally:
@@ -489,9 +538,9 @@ def build_dim_company():
 
 def build_dim_sector():
     """
-    Build dim_sector — มิติของ sector
+    Build dim_sector — มิติของ sector (enriched)
     Surrogate Key: sector_sk (sequential ID)
-    Source: gold_sector_war_summary
+    Source: gold_sector_war_summary (fully absorbed)
     """
     client = MongoClient(MONGO_URI)
     db = client[DB_NAME]
@@ -513,6 +562,10 @@ def build_dim_sector():
                 "stock_count": s.get("stock_count", 0),
                 "median_performance_shift": s.get("median_performance_shift", 0),
                 "avg_war_volatility": s.get("avg_war_volatility", 0),
+                # ── Enriched: absorbed from gold_sector_war_summary ──
+                "avg_war_cumulative_return": s.get("avg_war_cumulative_return", 0),
+                "top_5_winners": s.get("top_5_winners", []),
+                "top_5_losers": s.get("top_5_losers", []),
             })
 
         # ───── DQ Gate ─────
@@ -533,19 +586,26 @@ def build_dim_sector():
         client.close()
 
 
-def build_fact_daily_prices():
+def build_fact_war_analytics():
     """
-    Build fact_daily_prices — fact table หลัก
+    Build fact_war_analytics — fact table ใหญ่ตัวเดียว (แทน fact_daily_prices)
     Grain: 1 row ต่อ (symbol, date)
     Foreign Keys: date_sk, company_sk, sector_sk
+    Degenerate Dims: symbol, sector, date, period, week_key
     Measures: open, high, low, close, volume, daily_return_pct, moving_avg_*
+
+    รวมข้อมูลจาก gold 4 ตัวเดิมเข้ามาเป็น denormalized fields:
+    - gold_stock_ranking → อยู่ใน dim_company
+    - gold_sector_war_summary → อยู่ใน dim_sector
+    - gold_weekly_sector_performance → aggregation จาก fact
+    - gold_war_daily_timeline → aggregation จาก fact
 
     Source: silver_historical_daily + dim tables (สำหรับ FK lookup)
     """
     client = MongoClient(MONGO_URI)
     db = client[DB_NAME]
     silver_daily = db[SILVER_HISTORICAL_COLLECTION]
-    target = db[FACT_DAILY_PRICES_COLLECTION]
+    target = db[FACT_WAR_ANALYTICS_COLLECTION]
 
     try:
         # ───── โหลด FK lookup tables ─────
@@ -594,19 +654,28 @@ def build_fact_daily_prices():
                 skipped += 1
                 continue
 
-            date_sk = int(d.strftime("%Y%m%d"))
+            date_sk  = int(d.strftime("%Y%m%d"))
+            period   = "war" if d >= WAR_START else "pre_war"
+            week_key = d.strftime("%Y-W%W")
             key = (date_sk, company_sk)  # composite PK
 
             # ถ้าซ้ำ → ใช้ตัวล่าสุด (overwrite)
             records_dict[key] = {
-                "date_sk":    date_sk,                     # FK -> dim_date
-                "company_sk": company_sk,                  # FK -> dim_company
-                "sector_sk":  sector_sk,                   # FK -> dim_sector
+                # Foreign Keys
+                "date_sk":    date_sk,
+                "company_sk": company_sk,
+                "sector_sk":  sector_sk,
+                # Degenerate Dimensions (denormalized สำหรับ query convenience)
+                "symbol":     symbol,
+                "sector":     sector,
+                "date":       d.isoformat(),
+                "period":     period,
+                "week_key":   week_key,
                 # Measures (numeric facts)
                 "open":               r.get("open"),
                 "high":               r.get("high"),
                 "low":                r.get("low"),
-                "close":               r.get("close"),
+                "close":              r.get("close"),
                 "volume":             r.get("volume"),
                 "daily_return_pct":   r.get("daily_return_pct"),
                 "moving_avg_7d":      r.get("moving_avg_7d"),
@@ -616,7 +685,7 @@ def build_fact_daily_prices():
         records = list(records_dict.values())
 
         # ───── DQ Gate ─────
-        dq = DataQualityChecker(stage="fact_daily_prices")
+        dq = DataQualityChecker(stage="fact_war_analytics")
         dq.check_completeness(records, ["date_sk", "company_sk", "sector_sk", "close"])
         dq.check_uniqueness(records, ["date_sk", "company_sk"])  # composite key
         dq.check_validity(records, "close", min_value=0)
@@ -630,8 +699,13 @@ def build_fact_daily_prices():
             target.create_index("date_sk")
             target.create_index("company_sk")
             target.create_index("sector_sk")
+            # Indexes สำหรับ dashboard aggregation queries
+            target.create_index("symbol")
+            target.create_index([("sector", 1), ("week_key", 1)])  # weekly sector perf
+            target.create_index("period")
+            target.create_index("date")
 
-        print(f"Loaded {len(records)} records into {FACT_DAILY_PRICES_COLLECTION} "
+        print(f"Loaded {len(records)} records into {FACT_WAR_ANALYTICS_COLLECTION} "
               f"(skipped {skipped} due to missing FK)")
     finally:
         client.close()

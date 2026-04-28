@@ -30,6 +30,8 @@ while True:
         db = mongo_client['stock_database']
         collection = db['live_trades']
         print("เชื่อมต่อ MongoDB สำเร็จ!")
+        # TTL index: ลบ live_trades อัตโนมัติหลัง 7 วัน ป้องกัน collection โตไม่หยุด
+        collection.create_index("_created_at", expireAfterSeconds=86400 * 7)
         break
     except Exception as e:
         print(f"กำลังรอ MongoDB ... : {e}")
@@ -58,30 +60,29 @@ while True:
 # ============================================================
 print("กำลังดึงข้อมูลอ้างอิง (Baseline) จากฐานข้อมูล...")
 
-# --- 3a. baseline price ---
+# --- 3a. baseline price — ดึงจาก fact_war_analytics (star schema) ---
 baseline_prices = {}
-historical_col = db['historical_prices']
-cursor = historical_col.find({"Date": TARGET_BASELINE_DATE})
+fact_col = db['fact_war_analytics']
+cursor = fact_col.find({"date": TARGET_BASELINE_DATE}, {"_id": 0, "symbol": 1, "close": 1})
 for doc in cursor:
     symbol = doc.get('symbol')
-    close_price = doc.get('Close')
+    close_price = doc.get('close')
     if symbol and close_price:
         baseline_prices[symbol] = close_price
 print(f"ดึงราคา Baseline สำเร็จ: {len(baseline_prices)} ตัว")
 
-# --- 3b. baseline volume (ใหม่) — avg daily volume 30 วันก่อน war ---
-# ใช้ historical_prices ดึง volume ย้อนหลัง 30 records ต่อ symbol แล้ว average
+# --- 3b. baseline volume — avg daily volume 30 วันก่อน war จาก fact_war_analytics ---
 baseline_volumes = {}
 try:
     pipeline = [
-        {"$match": {"Volume": {"$exists": True, "$gt": 0}}},
-        {"$sort": {"symbol": 1, "Date": -1}},
+        {"$match": {"volume": {"$exists": True, "$gt": 0}}},
+        {"$sort": {"symbol": 1, "date": -1}},
         {"$group": {
             "_id": "$symbol",
-            "volumes": {"$push": "$Volume"},
+            "volumes": {"$push": "$volume"},
         }},
     ]
-    for doc in historical_col.aggregate(pipeline):
+    for doc in fact_col.aggregate(pipeline):
         symbol = doc["_id"]
         vols = doc["volumes"][:30]  # 30 วันล่าสุด
         if vols:
@@ -90,11 +91,11 @@ try:
 except Exception as e:
     print(f"[Warning] ดึง volume baseline ไม่ได้: {e} — volume alert จะถูก skip")
 
-# --- 3c. war impact map จาก silver (ใหม่) ---
+# --- 3c. war impact map จาก dim_company (star schema) ---
 war_impact_map = {}  # symbol -> war_impact_label
 sector_map = {}       # symbol -> sector
 try:
-    for doc in db['silver_stock_war_metrics'].find({}, {"symbol": 1, "war_impact": 1, "sector": 1, "_id": 0}):
+    for doc in db['dim_company'].find({}, {"symbol": 1, "war_impact": 1, "sector": 1, "_id": 0}):
         sym = doc.get("symbol")
         if sym:
             war_impact_map[sym] = doc.get("war_impact", "unknown")
@@ -180,6 +181,7 @@ for message in consumer:
     trade_data['war_impact']          = war_impact              
     trade_data['sector']              = sector                  
     trade_data['alert_at']            = datetime.now(timezone.utc).isoformat()  
+    trade_data['_created_at']         = datetime.now(timezone.utc)  # BSON Date for TTL index
 
     # --- เซฟลง MongoDB  ---
     try:

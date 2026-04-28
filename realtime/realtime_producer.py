@@ -48,7 +48,7 @@ def get_top_symbols():
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         db = client['stock_database']
 
-        ranking = list(db['gold_stock_ranking'].find(
+        ranking = list(db['dim_company'].find(
             {"performance_shift": {"$ne": None}},
             {"symbol": 1, "performance_shift": 1, "sector": 1, "_id": 0}
         ))
@@ -67,7 +67,7 @@ def get_top_symbols():
         # ───── 3) Sector Flagships: market_cap สูงสุดต่อ sector (10 ตัว) ─────
         flagship_symbols = []
         try:
-            sectors = list(db['gold_sector_war_summary'].find(
+            sectors = list(db['dim_sector'].find(
                 {"war_impact_label": {"$in": ["positive", "negative", "strong_positive", "strong_negative"]}},
                 {"sector": 1, "_id": 0}
             ))
@@ -79,7 +79,7 @@ def get_top_symbols():
                 if sector in seen_sectors:
                     continue
                 seen_sectors.add(sector)
-                top = list(db['silver_company_enriched'].find(
+                top = list(db['dim_company'].find(
                     {"sector": sector, "market_cap": {"$ne": None}, "symbol": {"$nin": list(used)}},
                     {"symbol": 1, "_id": 0}
                 ).sort("market_cap", -1).limit(1))

@@ -1,6 +1,7 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
+import pendulum
 
 from bronze.bronze_layer import load_sp500_daily_to_bronze
 from silver.silver_layer import (
@@ -17,7 +18,7 @@ from gold.gold_layer import (
     build_dim_date,
     build_dim_company,
     build_dim_sector,
-    build_fact_daily_prices,
+    build_fact_war_analytics,
 )
 from utils.alert_notifier import send_critical_pipeline_alert
 
@@ -54,11 +55,14 @@ default_args = {
 }
 
 
+# NYSE ปิด 16:00 ET → รัน 18:00 ET (2 ชม. หลังปิด ให้ข้อมูลครบ)
+ET = pendulum.timezone("America/New_York")
+
 with DAG(
     dag_id="sp500_daily_analytics_pipeline",
     default_args=default_args,
-    start_date=datetime(2026, 4, 1),
-    schedule="0 18 * * 1-5",
+    start_date=datetime(2026, 4, 1, tzinfo=ET),
+    schedule="0 18 * * 1-5",   # 18:00 ET Mon-Fri (2h after market close)
     catchup=False,
     tags=["sp500", "daily", "analytics"],
 ) as dag:
@@ -124,9 +128,9 @@ with DAG(
         python_callable=build_dim_sector,
     )
 
-    fact_daily_prices_task = PythonOperator(
-        task_id="build_fact_daily_prices",
-        python_callable=build_fact_daily_prices,
+    fact_war_analytics_task = PythonOperator(
+        task_id="build_fact_war_analytics",
+        python_callable=build_fact_war_analytics,
     )
 
     bronze_task >> silver_transform_task >> silver_classify_task
@@ -139,9 +143,9 @@ with DAG(
 
     # ───── Star Schema dependencies ─────
     # Dim tables depend on their sources:
-    silver_transform_task >> dim_date_task            # dim_date ← silver_historical
-    silver_enrich_task    >> dim_company_task          # dim_company ← silver_company_enriched
-    gold_sector_task      >> dim_sector_task           # dim_sector ← gold_sector_war_summary
+    silver_transform_task >> dim_date_task                         # dim_date ← silver_historical
+    [silver_enrich_task, gold_ranking_task] >> dim_company_task    # dim_company ← silver_company_enriched + gold_stock_ranking
+    gold_sector_task >> dim_sector_task                            # dim_sector ← gold_sector_war_summary
 
     # Fact table depends on ALL dimensions (FK lookup)
-    [dim_date_task, dim_company_task, dim_sector_task] >> fact_daily_prices_task
+    [dim_date_task, dim_company_task, dim_sector_task] >> fact_war_analytics_task
