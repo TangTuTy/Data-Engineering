@@ -13,8 +13,6 @@ from silver.silver_layer import (
 from gold.gold_layer import (
     build_gold_sector_summary,
     build_gold_stock_ranking,
-    build_gold_weekly_sector_performance,
-    build_gold_war_daily_timeline,
     build_dim_date,
     build_dim_company,
     build_dim_sector,
@@ -102,16 +100,6 @@ with DAG(
         python_callable=build_gold_stock_ranking,
     )
 
-    gold_weekly_task = PythonOperator(
-        task_id="build_gold_weekly_sector_performance",
-        python_callable=build_gold_weekly_sector_performance,
-    )
-
-    gold_timeline_task = PythonOperator(
-        task_id="build_gold_war_daily_timeline",
-        python_callable=build_gold_war_daily_timeline,
-    )
-
     # ───── Star Schema (Fact + Dimension Tables) ─────
     dim_date_task = PythonOperator(
         task_id="build_dim_date",
@@ -138,8 +126,6 @@ with DAG(
 
     silver_enrich_task >> gold_sector_task
     silver_enrich_task >> gold_ranking_task
-    [silver_transform_task, silver_enrich_task] >> gold_weekly_task
-    silver_transform_task >> gold_timeline_task
 
     # ───── Star Schema dependencies ─────
     # Dim tables depend on their sources:
